@@ -58,6 +58,7 @@ export default function Viewer() {
   const defaultDziFilename = location.state?.image_url; 
   const extractionId = location.state?.extractionId; 
   const initialROI = location.state?.roi; 
+    const startAnnotate = Boolean(location.state?.startAnnotate);
   const isAnnotationMode = !!extractionId;
 
   const [loading, setLoading] = useState(false);
@@ -86,6 +87,19 @@ export default function Viewer() {
   const [pathologist, setPathologist] = useState("");
   const [validationDate, setValidationDate] = useState("");
   const [labelInput, setLabelInput] = useState("Extraction");
+    const [analysisPhase, setAnalysisPhase] = useState<'overview' | 'annotate'>((isAnnotationMode || startAnnotate) ? 'annotate' : 'overview');
+    const [selectionRect, setSelectionRect] = useState<Shape | null>(
+            initialROI && initialROI.w > 0
+                    ? {
+                                type: 'rect',
+                                x: initialROI.x,
+                                y: initialROI.y,
+                                w: initialROI.w,
+                                h: initialROI.h,
+                                author: currentUser,
+                        }
+                    : null
+    );
 
   // Outils
   const [currentTool, setCurrentTool] = useState<ToolType>('move');
@@ -170,11 +184,59 @@ export default function Viewer() {
   }, [rawUrl, isAnnotationMode, initialROI]);
 
   useEffect(() => {
+      if (!startAnnotate || selectionRect || !folderId) {
+          return;
+      }
+
+      const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      fetch(`${baseUrl}/patients/${encodeURIComponent(folderId)}/extractions`)
+          .then((response) => response.json())
+          .then((data) => {
+              if (!Array.isArray(data) || data.length === 0) {
+                  return;
+              }
+
+              const latest = data[0] as { roi?: { x?: number; y?: number; w?: number; h?: number } };
+              const roi = latest.roi;
+              if (!roi) {
+                  return;
+              }
+
+              const width = roi.w ?? 0;
+              const height = roi.h ?? 0;
+              if (width <= 0 || height <= 0) {
+                  return;
+              }
+
+              setSelectionRect({
+                  type: 'rect',
+                  x: roi.x ?? 0,
+                  y: roi.y ?? 0,
+                  w: width,
+                  h: height,
+                  author: currentUser,
+              });
+          })
+          .catch(() => {
+              // Pas bloquant: si aucune extraction trouvée, l'utilisateur peut créer une zone.
+          });
+  }, [startAnnotate, selectionRect, folderId, currentUser]);
+
+  useEffect(() => {
       if (viewerRef.current) {
           const canPan = currentTool === 'move' && movingShapeIndex === null;
           viewerRef.current.setMouseNavEnabled(canPan);
       }
   }, [currentTool, movingShapeIndex]);
+
+  useEffect(() => {
+      if (analysisPhase === 'overview') {
+          setCurrentTool('rect');
+          setPendingTextPos(null);
+          setEditingShapeIndex(null);
+          setPolyPoints([]);
+      }
+  }, [analysisPhase]);
 
   const handleAiAnalysis = () => {
       setLoading(true);
@@ -246,6 +308,7 @@ export default function Viewer() {
       if (!viewerRef.current) return;
       if (editingShapeIndex !== null) return;
       if (currentTool === 'move' || pendingTextPos) return;
+      if (analysisPhase === 'overview' && currentTool !== 'rect') return;
 
       const { x, y } = getCoords(e);
       if (currentTool === 'text') { setPendingTextPos({x, y}); setTextValue(""); return; }
@@ -300,10 +363,87 @@ export default function Viewer() {
       };
 
       if ((newShape.w ?? 0) > 5 || (newShape.radius && newShape.radius > 5)) {
-          setShapes(prev => [...prev, newShape]); 
-          if (!isAnnotationMode) { setCurrentTool('move'); setShowSidebar(true); }
+          if (analysisPhase === 'overview' && newShape.type === 'rect') {
+              setSelectionRect(newShape);
+              setCurrentTool('move');
+          } else {
+              setShapes(prev => [...prev, newShape]); 
+              if (!isAnnotationMode) { setCurrentTool('move'); setShowSidebar(true); }
+          }
       }
       setDragStart(null); setCurrentDragShape(null);
+  };
+
+  const handleViewAll = () => {
+      setAnalysisPhase('overview');
+      setShowSidebar(false);
+      if (viewerRef.current) {
+          viewerRef.current.viewport.goHome(true);
+      }
+  };
+
+  const handleSaveZone = async () => {
+      if (!selectionRect || (selectionRect.w ?? 0) <= 0 || (selectionRect.h ?? 0) <= 0) {
+          alert("Sélectionnez d'abord une zone avec un rectangle.");
+          return;
+      }
+
+      setLoading(true);
+      const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const payload = {
+          filename: defaultDziFilename || rawUrl || "biopsie_cmu_1.dzi",
+          x: Math.round(selectionRect.x || 0),
+          y: Math.round(selectionRect.y || 0),
+          width: Math.round(selectionRect.w || 0),
+          height: Math.round(selectionRect.h || 0),
+          patient_folder: folderId,
+          patient_name: patientName,
+          annotation_label: labelInput || "Zone sélectionnée",
+          owner: currentUser,
+          prelevement_type: prelevementType,
+          prelevement_date: prelevementDate,
+          block_number: blockNumber,
+          fixation: fixation,
+          slide_count: slideCount === '' ? null : parseInt(slideCount),
+          staining: staining,
+          macro_obs: macroObs,
+          micro_obs: microObs,
+          histo_type: histoType,
+          sbr_grade: sbrGrade,
+          margins: margins,
+          hormonal_receptors: hormonalReceptors,
+          diagnosis: diagnosis,
+          comments: comments,
+          status: status,
+          pathologist: pathologist,
+          validation_date: validationDate,
+          drawings: [],
+      };
+
+      try {
+          const res = await fetch(`${baseUrl}/extract-roi`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+          });
+
+          const data = await res.json();
+          if (!res.ok) {
+              alert("Erreur serveur lors de l'enregistrement de la zone.");
+              return;
+          }
+
+          const createdId = data?.extraction_id ?? data?.id ?? null;
+          if (createdId) {
+              setNewExtractionId(createdId);
+          }
+          alert("✅ Zone enregistrée.");
+          navigate(-1);
+      } catch {
+          alert("Erreur réseau lors de l'enregistrement de la zone.");
+      } finally {
+          setLoading(false);
+      }
   };
 
   const handleDoubleClick = () => {
@@ -452,6 +592,28 @@ export default function Viewer() {
       });
   };
 
+  const renderSelectionRect = () => {
+      if (!selectionRect || !viewerRef.current) return null;
+      const rectWidth = selectionRect.w ?? 0;
+      const rectHeight = selectionRect.h ?? 0;
+      const p1 = viewerRef.current.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(selectionRect.x, selectionRect.y));
+      const p2 = viewerRef.current.viewport.imageToViewerElementCoordinates(new OpenSeadragon.Point(selectionRect.x + rectWidth, selectionRect.y + rectHeight));
+
+      return (
+          <rect
+              x={p1.x}
+              y={p1.y}
+              width={p2.x - p1.x}
+              height={p2.y - p1.y}
+              fill="rgba(14, 165, 233, 0.12)"
+              stroke="#0ea5e9"
+              strokeWidth="3"
+              strokeDasharray="8 6"
+              style={{ pointerEvents: 'none' }}
+          />
+      );
+  };
+
   useEffect(() => {
       if (extractionId) {
           setLoading(true);
@@ -516,7 +678,7 @@ export default function Viewer() {
       if (!shapes.length && !extractionId) return;
       setLoading(true);
       const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-      const shape = shapes.length > 0 ? shapes[0] : { x:0, y:0, w:0, h:0 };
+    const shape = selectionRect || (shapes.length > 0 ? shapes[0] : { x:0, y:0, w:0, h:0 });
       
       const payload = {
           filename: defaultDziFilename || "biopsie_cmu_1.dzi",
@@ -560,7 +722,8 @@ export default function Viewer() {
               if (!isAnnotationMode) {
                   if (data && data.extraction_id) setNewExtractionId(data.extraction_id);
                   else if (data && data.id) setNewExtractionId(data.id);
-                  setShowSuccessModal(true);
+                  alert("✅ Extraction créée !");
+                  navigate('/inbox');
               } else {
                   alert("✅ Dossier mis à jour !");
                   navigate('/inbox');
@@ -591,7 +754,7 @@ export default function Viewer() {
                   </div>
                   <div className="flex items-center gap-2">
                       <span className="w-5 h-5 flex items-center justify-center bg-white/10 rounded">✏️</span>
-                      <span>Annnoter: Choisir un outil en bas</span>
+                      <span>Étape 1: Voir tout + enregistrer zone, puis Annoter depuis l'accueil</span>
                   </div>
               </div>
           </div>
@@ -600,6 +763,7 @@ export default function Viewer() {
           <div className={`absolute inset-0 z-10 ${currentTool === 'move' && !pendingTextPos && movingShapeIndex === null ? 'pointer-events-none' : 'cursor-crosshair pointer-events-auto'}`}
             onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onDoubleClick={handleDoubleClick}>
             <svg className="w-full h-full">
+                {renderSelectionRect()}
                 {renderShapes()}
                 {currentDragShape && currentTool === 'rect' && <rect x={currentDragShape.x} y={currentDragShape.y} width={currentDragShape.w} height={currentDragShape.h} fill="rgba(239, 68, 68, 0.3)" stroke="#ef4444" strokeWidth="2" />}
                 {currentDragShape && currentTool === 'circle' && <circle cx={currentDragShape.x} cy={currentDragShape.y} r={currentDragShape.radius} fill="rgba(239, 68, 68, 0.3)" stroke="#ef4444" strokeWidth="2" />}
@@ -656,20 +820,33 @@ export default function Viewer() {
                 <button onClick={() => setCurrentTool('move')} className={`p-3 rounded-xl transition-all ${currentTool === 'move' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'}`} title="Déplacer"><PanToolIcon /></button>
                 <div className="w-px bg-white/10 mx-1 my-2"></div>
                 <button onClick={() => setCurrentTool('rect')} className={`p-3 rounded-xl transition-all ${currentTool === 'rect' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-emerald-400'}`} title="Rectangle"><CropSquareIcon /></button>
-                <button onClick={() => setCurrentTool('circle')} className={`p-3 rounded-xl transition-all ${currentTool === 'circle' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-blue-400'}`} title="Cercle"><RadioButtonUncheckedIcon /></button>
-                <button onClick={() => {setCurrentTool('polygon'); setPolyPoints([])}} className={`p-3 rounded-xl transition-all ${currentTool === 'polygon' ? 'bg-amber-600 text-white' : 'text-slate-400 hover:text-amber-400'}`} title="Polygone"><PolylineIcon /></button>
-                <button onClick={() => {setCurrentTool('text'); setPendingTextPos(null)}} className={`p-3 rounded-xl transition-all ${currentTool === 'text' ? 'bg-yellow-600 text-white' : 'text-slate-400 hover:text-yellow-400'}`} title="Texte"><TextFieldsIcon /></button>
+                <button onClick={() => setCurrentTool('circle')} disabled={analysisPhase !== 'annotate'} className={`p-3 rounded-xl transition-all ${currentTool === 'circle' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-blue-400'} ${analysisPhase !== 'annotate' ? 'opacity-40 cursor-not-allowed' : ''}`} title="Cercle"><RadioButtonUncheckedIcon /></button>
+                <button onClick={() => {setCurrentTool('polygon'); setPolyPoints([])}} disabled={analysisPhase !== 'annotate'} className={`p-3 rounded-xl transition-all ${currentTool === 'polygon' ? 'bg-amber-600 text-white' : 'text-slate-400 hover:text-amber-400'} ${analysisPhase !== 'annotate' ? 'opacity-40 cursor-not-allowed' : ''}`} title="Polygone"><PolylineIcon /></button>
+                <button onClick={() => {setCurrentTool('text'); setPendingTextPos(null)}} disabled={analysisPhase !== 'annotate'} className={`p-3 rounded-xl transition-all ${currentTool === 'text' ? 'bg-yellow-600 text-white' : 'text-slate-400 hover:text-yellow-400'} ${analysisPhase !== 'annotate' ? 'opacity-40 cursor-not-allowed' : ''}`} title="Texte"><TextFieldsIcon /></button>
              </div>
 
              <div className="pointer-events-auto flex gap-3">
+                <button
+                    onClick={handleViewAll}
+                    className={`px-4 py-3 rounded-2xl font-bold shadow-xl transition-all ${analysisPhase === 'overview' ? 'bg-cyan-600 text-white' : 'bg-slate-800/90 text-slate-200 border border-slate-600 hover:bg-slate-700'}`}
+                >
+                    Voir tout
+                </button>
+                <button
+                    onClick={handleSaveZone}
+                    disabled={loading || !selectionRect || (selectionRect.w ?? 0) <= 0 || (selectionRect.h ?? 0) <= 0}
+                    className={`px-4 py-3 rounded-2xl font-bold shadow-xl transition-all bg-slate-800/90 text-slate-200 border border-slate-600 hover:bg-slate-700 ${loading || !selectionRect || (selectionRect.w ?? 0) <= 0 || (selectionRect.h ?? 0) <= 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                    Enregistrer la zone
+                </button>
                  <button onClick={handleDownloadSnapshot} className="p-3 bg-slate-800/90 backdrop-blur-md text-white border border-slate-600 rounded-2xl hover:bg-indigo-600 transition-all shadow-lg"><CameraAltIcon /></button>
-                {shapes.length > 0 && <button onClick={handleUndo} className="p-3 bg-slate-700/80 backdrop-blur-md text-white border border-slate-500 rounded-2xl hover:bg-slate-600 transition-all shadow-lg" title="Annuler dernier"><UndoIcon /></button>}
-                {shapes.length > 0 && <button onClick={handleDeleteAll} className="p-3 bg-red-500/20 text-red-400 border border-red-500/50 rounded-2xl hover:bg-red-500 hover:text-white"><DeleteForeverIcon /></button>}
+                {analysisPhase === 'annotate' && shapes.length > 0 && <button onClick={handleUndo} className="p-3 bg-slate-700/80 backdrop-blur-md text-white border border-slate-500 rounded-2xl hover:bg-slate-600 transition-all shadow-lg" title="Annuler dernier"><UndoIcon /></button>}
+                {analysisPhase === 'annotate' && shapes.length > 0 && <button onClick={handleDeleteAll} className="p-3 bg-red-500/20 text-red-400 border border-red-500/50 rounded-2xl hover:bg-red-500 hover:text-white"><DeleteForeverIcon /></button>}
                 
                 <button 
                     onClick={handleAiAnalysis} 
-                    disabled={loading}
-                    className={`px-4 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-xl transition-all ${aiSuggestion ? 'bg-slate-700 text-slate-300 border border-slate-500 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-500'}`}
+                    disabled={loading || analysisPhase !== 'annotate'}
+                    className={`px-4 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-xl transition-all ${aiSuggestion ? 'bg-slate-700 text-slate-300 border border-slate-500 cursor-not-allowed' : 'bg-indigo-600 text-white hover:bg-indigo-500'} ${analysisPhase !== 'annotate' ? 'opacity-40 cursor-not-allowed' : ''}`}
                 >
                     <SmartToyIcon /> {loading ? "..." : (aiSuggestion ? "IA Terminée" : "IA")}
                 </button>

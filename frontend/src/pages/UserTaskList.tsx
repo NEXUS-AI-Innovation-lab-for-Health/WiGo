@@ -13,6 +13,14 @@ import {
 
 const USER_STORAGE_KEY = 'biopsie_user';
 
+interface SavedExtraction {
+  id: number;
+  filename: string;
+  url: string;
+  roi: { x: number; y: number; w: number; h: number };
+  owner?: string;
+}
+
 const parseCurrentUser = (): AuthUser | null => {
   const raw = localStorage.getItem(USER_STORAGE_KEY);
   if (!raw) {
@@ -35,10 +43,14 @@ export default function UserTaskList() {
   const navigate = useNavigate();
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => parseCurrentUser());
   const [medicalCases, setMedicalCases] = useState<MedicalCase[]>([]);
+  const [caseHasSavedZone, setCaseHasSavedZone] = useState<Record<number, boolean>>({});
   const [selectedCase, setSelectedCase] = useState<MedicalCase | null>(null);
   const [activeSchema, setActiveSchema] = useState<FormSchema | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [popupCase, setPopupCase] = useState<MedicalCase | null>(null);
+  const [popupExtractions, setPopupExtractions] = useState<SavedExtraction[]>([]);
+  const [popupLoading, setPopupLoading] = useState(false);
 
   const userRole: UserRole | undefined = currentUser?.role;
 
@@ -73,6 +85,46 @@ export default function UserTaskList() {
 
     void loadCases();
   }, [currentUser, loadCases, navigate]);
+
+  useEffect(() => {
+    if (!medicalCases.length) {
+      setCaseHasSavedZone({});
+      return;
+    }
+
+    const controller = new AbortController();
+    const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+    const loadExtractionAvailability = async () => {
+      const checks = await Promise.all(
+        medicalCases.map(async (item) => {
+          try {
+            const response = await fetch(`${baseUrl}/patients/CASE-${item.id}/extractions`, {
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              return [item.id, false] as const;
+            }
+
+            const data = (await response.json()) as unknown;
+            return [item.id, Array.isArray(data) && data.length > 0] as const;
+          } catch {
+            return [item.id, false] as const;
+          }
+        })
+      );
+
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      setCaseHasSavedZone(Object.fromEntries(checks));
+    };
+
+    void loadExtractionAvailability();
+
+    return () => controller.abort();
+  }, [medicalCases]);
 
   const openCurrentStepForm = async (item: MedicalCase) => {
     const formId = item.current_step_meta?.form_id;
@@ -131,6 +183,41 @@ export default function UserTaskList() {
     localStorage.removeItem(USER_STORAGE_KEY);
     setCurrentUser(null);
     navigate('/login');
+  };
+
+  const openAnnotatePopup = async (item: MedicalCase) => {
+    setPopupCase(item);
+    setPopupExtractions([]);
+    setPopupLoading(true);
+
+    const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+    try {
+      const response = await fetch(`${baseUrl}/patients/CASE-${item.id}/extractions`);
+      const data = (await response.json()) as unknown;
+      if (Array.isArray(data)) {
+        setPopupExtractions(data as SavedExtraction[]);
+      } else {
+        setPopupExtractions([]);
+      }
+    } catch {
+      setPopupExtractions([]);
+    } finally {
+      setPopupLoading(false);
+    }
+  };
+
+  const goToAnnotateExtraction = (item: MedicalCase, extraction: SavedExtraction) => {
+    setPopupCase(null);
+    const viewerUrl = extraction.url || 'biopsie_cmu_1.dzi';
+    navigate(`/viewer?url=${encodeURIComponent(viewerUrl)}`, {
+      state: {
+        patientName: item.patient.name,
+        folderId: `CASE-${item.id}`,
+        image_url: extraction.url,
+        extractionId: extraction.id,
+        roi: extraction.roi,
+      },
+    });
   };
 
   return (
@@ -201,7 +288,7 @@ export default function UserTaskList() {
                     navigate(`/viewer?url=biopsie_cmu_1.dzi`, {
                       state: {
                         patientName: item.patient.name,
-                        folderId: `CASE-${item.id}`
+                        folderId: `CASE-${item.id}`,
                       }
                     });
                   }}
@@ -210,6 +297,16 @@ export default function UserTaskList() {
                 >
                   👁️
                 </button>
+                {caseHasSavedZone[item.id] && (
+                  <button
+                    type="button"
+                    onClick={() => void openAnnotatePopup(item)}
+                    className="px-4 py-2 rounded-lg text-sm font-semibold bg-indigo-600 hover:bg-indigo-500"
+                    title="Annoter"
+                  >
+                    ✍️
+                  </button>
+                )}
               </div>
             </article>
           ))}
@@ -232,14 +329,23 @@ export default function UserTaskList() {
                     navigate(`/viewer?url=biopsie_cmu_1.dzi`, {
                       state: {
                         patientName: selectedCase.patient.name,
-                        folderId: `CASE-${selectedCase.id}`
+                        folderId: `CASE-${selectedCase.id}`,
                       }
                     });
                   }}
                   className="text-sm px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium flex items-center gap-1"
                 >
-                  Ouvrir l'Image
+                  👁️
                 </button>
+                {caseHasSavedZone[selectedCase.id] && (
+                  <button
+                    type="button"
+                    onClick={() => void openAnnotatePopup(selectedCase)}
+                    className="text-sm px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium"
+                  >
+                    ✍️ Annoter
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -262,6 +368,53 @@ export default function UserTaskList() {
           </section>
         ) : null}
       </div>
+
+      {popupCase ? (
+        <div
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+          onClick={() => setPopupCase(null)}
+        >
+          <div
+            className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="p-4 border-b border-slate-700 bg-slate-800">
+              <h3 className="text-white font-bold">Zones sélectionnées</h3>
+              <p className="text-xs text-slate-400">Patient: {popupCase.patient.name}</p>
+            </div>
+
+            <div className="p-3 max-h-72 overflow-y-auto space-y-2">
+              {popupLoading ? (
+                <p className="text-slate-400 text-sm text-center py-6">Chargement...</p>
+              ) : popupExtractions.length === 0 ? (
+                <p className="text-slate-400 text-sm text-center py-6">Aucune zone enregistrée.</p>
+              ) : (
+                popupExtractions.map((extraction) => (
+                  <button
+                    key={extraction.id}
+                    type="button"
+                    onClick={() => goToAnnotateExtraction(popupCase, extraction)}
+                    className="w-full text-left rounded-xl border border-slate-700 bg-slate-800 hover:bg-slate-700 px-3 py-2 transition-colors"
+                  >
+                    <p className="text-sm font-semibold text-white">{extraction.filename}</p>
+                    <p className="text-[11px] text-slate-400">#{extraction.id} · {extraction.owner || 'Inconnu'}</p>
+                  </button>
+                ))
+              )}
+            </div>
+
+            <div className="p-3 border-t border-slate-700 bg-slate-800">
+              <button
+                type="button"
+                onClick={() => setPopupCase(null)}
+                className="w-full py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm"
+              >
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -42,7 +42,6 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
   const navigate = useNavigate();
   const [extractions, setExtractions] = useState<Extraction[]>([]);
   const [showModal, setShowModal] = useState(false);
-  const [hasExtractions, setHasExtractions] = useState(false);
 
   const doctorName = localStorage.getItem("biopsie_user") || "Dr. Non assigné";
 
@@ -71,10 +70,9 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
             const res = await fetch(`${apiUrl}/patients/${patient.folder_id}/extractions`);
             const data = await res.json();
             if (data && data.length > 0) {
-                setHasExtractions(true);
                 setExtractions(data); 
             } else {
-                setHasExtractions(false);
+              setExtractions([]);
             }
         } catch (e) { console.error("Erreur check extractions", e); }
     };
@@ -101,7 +99,6 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
         if (res.ok) {
             const newExtractions = extractions.filter(ex => ex.id !== id);
             setExtractions(newExtractions);
-            if (newExtractions.length === 0) setHasExtractions(false); 
         } else {
             const err = await res.json();
             alert("Erreur: " + err.detail);
@@ -170,14 +167,21 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
       {/* ACTIONS */}
       <div className="flex gap-3 mt-auto">
         <button onClick={() => mainBiopsyUrl && openViewer()} className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-colors">
-            <VisibilityIcon fontSize="small"/> Nouvelle
+          <VisibilityIcon fontSize="small"/> Voir
         </button>
-        
-        {hasExtractions && (
-            <button onClick={handleAnnotateClick} className="flex-1 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg shadow-cyan-900/20">
-                <EditIcon fontSize="small"/> Ouvrir
-            </button>
-        )}
+
+        <button
+          onClick={handleAnnotateClick}
+          disabled={extractions.length === 0}
+          className={`flex-1 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all ${
+            extractions.length > 0
+              ? 'bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white shadow-lg shadow-cyan-900/20'
+              : 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed'
+          }`}
+          title={extractions.length > 0 ? 'Annoter une zone enregistrée' : 'Sélectionnez et enregistrez une zone avec le bouton Voir'}
+        >
+          <EditIcon fontSize="small"/> Annoter
+        </button>
       </div>
 
       {/* MODAL LISTE DES DOSSIERS */}
