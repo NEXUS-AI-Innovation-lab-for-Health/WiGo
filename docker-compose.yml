@@ -35,7 +35,7 @@ services:
           aliases:
             - minio
 
-# --- PACS Radiologie (Orthanc) ---
+  # --- PACS Radiologie (Orthanc) ---
   orthanc:
     image: jodogne/orthanc-plugins:1.12.0
     container_name: p6_orthanc
@@ -53,12 +53,12 @@ services:
   backend:
     build: ./backend
     container_name: p6_backend
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn main:app --host 0.0.0.0 --port 8002
     volumes:
       - ./backend:/app
       - ./backend/dzi_data:/app/dzi_data 
     ports:
-      - "8000:8000"
+      - "8002:8002"
     environment:
       - DATABASE_URL=postgresql://user:password@p6_postgres:5432/p6_db
       - MINIO_ENDPOINT=minio:9000
@@ -98,7 +98,7 @@ services:
     ports:
       - "5173:5173"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_API_URL=http://localhost:8002
     networks:
       - app_network
 
