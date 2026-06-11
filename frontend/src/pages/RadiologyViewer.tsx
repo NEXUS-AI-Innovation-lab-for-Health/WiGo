@@ -15,13 +15,16 @@ import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import TextFormatIcon from "@mui/icons-material/TextFormat";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DeleteSweepIcon from "@mui/icons-material/DeleteSweep";
+import PersonIcon from "@mui/icons-material/Person";
 
 // --- IMPORTATION DU MOTEUR CORNERSTONE (Natif) ---
 import cornerstone from "cornerstone-core";
 import cornerstoneMath from "cornerstone-math";
+// @ts-ignore
 import cornerstoneTools from "cornerstone-tools";
 import dicomParser from "dicom-parser";
 import cornerstoneWADOImageLoader from "cornerstone-wado-image-loader";
+// @ts-ignore
 import Hammer from "hammerjs";
 import jsPDF from "jspdf";
 
@@ -39,7 +42,44 @@ function configureCornerstone() {
   isConfigured = true;
 }
 
-export default function RadiologyViewer() {
+// 🌟 L'Extracteur d'identité robuste
+function getConnectedUser() {
+  let doctorName = "Inconnu";
+  try {
+    const possibleKeys = ["user", "auth", "session", "profile", "username", "biopsie_user"];
+    for (const key of possibleKeys) {
+      const val = localStorage.getItem(key) || sessionStorage.getItem(key);
+      if (val) {
+        try {
+          const parsed = JSON.parse(val);
+          doctorName = parsed.username || parsed.name || parsed.email || parsed.user?.username || parsed.user?.name || "Inconnu";
+          if (doctorName !== "Inconnu") break;
+        } catch (e) {
+          doctorName = val;
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Erreur lecture identité:", e);
+  }
+  
+  if (doctorName !== "Inconnu" && !doctorName.toLowerCase().startsWith("dr")) {
+    return `Dr. ${doctorName}`;
+  }
+  return doctorName === "Inconnu" ? "Dr. Inconnu" : doctorName;
+}
+
+interface RadiologyViewerProps {
+  currentUser?: {
+    name: string;
+    profession: string;
+  };
+}
+
+export default function RadiologyViewer({ 
+  currentUser 
+}: RadiologyViewerProps) {
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -47,12 +87,22 @@ export default function RadiologyViewer() {
   const patientId = searchParams.get("patient") || "Inconnu";
   const studyId = searchParams.get("study");
 
+  const storedName = localStorage.getItem("biopsie_user") || "Inconnu";
+  const formattedName = (storedName !== "Inconnu" && !storedName.toLowerCase().startsWith("dr")) 
+    ? `Dr. ${storedName}` 
+    : storedName;
+
+  const finalUser = {
+    name: currentUser?.name && currentUser.name !== "Dr. Inconnu" ? currentUser.name : (formattedName === "Inconnu" ? "Dr. Inconnu" : formattedName),
+    profession: currentUser?.profession || "Médecin"
+  };
+
   const [report, setReport] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [savedSource, setSavedSource] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-
   const [activeTool, setActiveTool] = useState("Wwwc");
+  const [lastModifiedBy, setLastModifiedBy] = useState<string | null>(null);
 
   const viewerRef = useRef<HTMLDivElement>(null);
 
@@ -68,7 +118,9 @@ export default function RadiologyViewer() {
           `http://localhost:8000/radiology/${studyId}/report`,
         );
         const dbData = await dbRes.json();
+        
         if (dbData.report) setReport(dbData.report);
+        if (dbData.lastModifiedBy) setLastModifiedBy(dbData.lastModifiedBy);
 
         const response = await fetch(`/orthanc/studies/${studyId}/instances`);
         if (!response.ok) throw new Error("Erreur de connexion API Orthanc");
@@ -102,7 +154,6 @@ export default function RadiologyViewer() {
           }
         });
 
-        // Configuration spécifique pour l'outil de texte (ArrowAnnotateTool)
         const arrowConfig = {
           getTextCallback: (
             doneChangingTextCallback: (text: string) => void,
@@ -131,9 +182,7 @@ export default function RadiologyViewer() {
             cornerstoneTools.ArrowAnnotateTool,
             { configuration: arrowConfig },
           );
-        } catch (e) {
-          /* ignore */
-        }
+        } catch (e) {}
 
         // Affichage de l'image DICOM
         const image = await cornerstone.loadImage(dicomUrl);
@@ -146,7 +195,7 @@ export default function RadiologyViewer() {
           mouseButtonMask: 1,
         });
 
-        // Restoration des annotations depuis la base de données
+        // Restauration robuste
         if (
           dbData.annotations &&
           dbData.annotations.length > 5 &&
@@ -154,9 +203,7 @@ export default function RadiologyViewer() {
         ) {
           try {
             const parsedState = JSON.parse(dbData.annotations);
-            cornerstoneTools.globalImageIdSpecificToolStateManager.restoreToolState(
-              parsedState,
-            );
+            cornerstoneTools.globalImageIdSpecificToolStateManager.toolState = parsedState;
 
             setTimeout(() => {
               if (viewerRef.current) {
@@ -184,7 +231,6 @@ export default function RadiologyViewer() {
     };
   }, [studyId]);
 
-  // Sauvegarde des annotations et du texte clinique
   const handleSaveData = async (source: "annotations" | "texte") => {
     if (!studyId) return;
     setIsSaving(true);
@@ -192,9 +238,7 @@ export default function RadiologyViewer() {
     let annotationsStr = "{}";
 
     try {
-      const rawState =
-        cornerstoneTools.globalImageIdSpecificToolStateManager.saveToolState();
-
+      const rawState = cornerstoneTools.globalImageIdSpecificToolStateManager.toolState;
       if (rawState) {
         annotationsStr = JSON.stringify(rawState);
       }
@@ -202,18 +246,25 @@ export default function RadiologyViewer() {
       console.error("Erreur d'extraction des dessins :", err);
     }
 
+    const doctorSignature = `${finalUser.name} (${finalUser.profession})`;
+
     try {
       const res = await fetch(
         `http://localhost:8000/radiology/${studyId}/report`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ report: report, annotations: annotationsStr }),
+          body: JSON.stringify({ 
+            report: report, 
+            annotations: annotationsStr,
+            lastModifiedBy: doctorSignature
+          }),
         },
       );
 
       if (res.ok) {
         setSavedSource(source);
+        setLastModifiedBy(doctorSignature);
         setTimeout(() => setSavedSource(null), 3000);
       } else {
         console.error("Le serveur a renvoyé une erreur lors de la sauvegarde.");
@@ -225,7 +276,7 @@ export default function RadiologyViewer() {
     }
   };
 
-  // Suppression totale des annotations
+  // 🌟 SUPPRESSION TOTALE CORRIGÉE (Efface visuellement l'écran en forçant chaque outil)
   const handleClearAll = async () => {
     if (!viewerRef.current || !studyId) return;
 
@@ -238,42 +289,39 @@ export default function RadiologyViewer() {
     setIsSaving(true);
 
     try {
-      const enabledElement = cornerstone.getEnabledElement(element);
-      if (enabledElement && enabledElement.image) {
-        const imageId = enabledElement.image.imageId;
+      // 1. On force le nettoyage visuel outil par outil (API Cornerstone officielle)
+      const toolsToClear = [
+        "Length",
+        "RectangleRoi",
+        "EllipticalRoi",
+        "ArrowAnnotate",
+      ];
+      toolsToClear.forEach((tool) => {
+        cornerstoneTools.clearToolState(element, tool);
+      });
 
-        // 1. On vide la mémoire brute liée à cette image
-        delete cornerstoneTools.globalImageIdSpecificToolStateManager.toolState[
-          imageId
-        ];
+      // 2. On redessine l'image (le canvas redevient vide)
+      cornerstone.updateImage(element);
 
-        // 2. On force le nettoyage visuel outil par outil
-        const toolsToClear = [
-          "Length",
-          "RectangleRoi",
-          "EllipticalRoi",
-          "ArrowAnnotate",
-        ];
-        toolsToClear.forEach((tool) => {
-          cornerstoneTools.clearToolState(element, tool);
-        });
+      // 3. On sauvegarde ce vide absolu dans la base de données
+      const doctorSignature = `${finalUser.name} (${finalUser.profession})`;
 
-        // 3. On redessine l'image
-        cornerstone.updateImage(element);
-      }
-
-      // 4. On sauvegarde l'état vide en base de données
       const res = await fetch(
         `http://localhost:8000/radiology/${studyId}/report`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ report: report, annotations: "{}" }),
+          body: JSON.stringify({ 
+            report: report, 
+            annotations: "{}",
+            lastModifiedBy: doctorSignature
+          }),
         },
       );
 
       if (res.ok) {
         setSavedSource("annotations");
+        setLastModifiedBy(doctorSignature);
         setTimeout(() => setSavedSource(null), 3000);
       }
     } catch (e) {
@@ -283,7 +331,6 @@ export default function RadiologyViewer() {
     }
   };
 
-  // Changement d'outil actif
   const changeTool = (toolName: string) => {
     if (!viewerRef.current) return;
     const element = viewerRef.current;
@@ -310,7 +357,6 @@ export default function RadiologyViewer() {
     setActiveTool(toolName);
   };
 
-  // Exportation du compte-rendu en PDF
   const handleExportPDF = () => {
     const doc = new jsPDF();
     doc.setFontSize(22);
@@ -319,31 +365,31 @@ export default function RadiologyViewer() {
     doc.setFontSize(12);
     doc.setTextColor(100, 116, 139);
     doc.text(`Patient ID : ${patientId}`, 20, 30);
-    doc.text(
-      `Date de l'export : ${new Date().toLocaleDateString("fr-FR")}`,
-      20,
-      37,
-    );
+    doc.text(`Date de l'export : ${new Date().toLocaleDateString("fr-FR")}`, 20, 37);
+    
+    doc.text(`Dernière mise à jour par : ${lastModifiedBy || finalUser.name}`, 20, 44);
+
     doc.setDrawColor(203, 213, 225);
-    doc.line(20, 42, 190, 42);
+    doc.line(20, 49, 190, 49);
     doc.setFontSize(14);
     doc.setTextColor(15, 23, 42);
-    doc.text("Observations cliniques :", 20, 55);
+    doc.text("Observations cliniques :", 20, 62);
     doc.setFontSize(11);
     doc.setTextColor(51, 65, 85);
     const splitText = doc.splitTextToSize(
       report || "Aucune observation saisie.",
       170,
     );
-    doc.text(splitText, 20, 65);
+    doc.text(splitText, 20, 72);
     doc.setFontSize(9);
     doc.setTextColor(148, 163, 184);
-    doc.text("Document généré par le DPI Wigo.", 20, 280);
+    doc.text("Document généré par le DPI Wigo / OncoCollab.", 20, 280);
     doc.save(`Compte_Rendu_${patientId}.pdf`);
   };
 
   return (
     <div className="h-screen w-screen bg-black flex flex-col font-sans text-white overflow-hidden">
+      
       <div className="bg-slate-950 border-b border-slate-800 p-3 flex justify-between items-center z-20 shadow-xl">
         <div className="flex items-center gap-4">
           <button
@@ -361,10 +407,19 @@ export default function RadiologyViewer() {
             </p>
           </div>
         </div>
+
+        <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 px-4 py-2 rounded-xl">
+          <div className="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400">
+            <PersonIcon fontSize="small" />
+          </div>
+          <div className="text-right">
+            <p className="text-sm font-bold text-white leading-tight">{finalUser.name}</p>
+            <p className="text-xs text-slate-400 leading-tight">{finalUser.profession}</p>
+          </div>
+        </div>
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Colonne gauche : Barre d'outils + Image */}
         <div className="flex-1 flex flex-col relative bg-black border-r border-slate-800">
           <div className="flex flex-wrap gap-2 bg-slate-900 p-2 border-b border-slate-800 shadow-inner justify-center z-10">
             <button
@@ -409,7 +464,6 @@ export default function RadiologyViewer() {
 
             <div className="w-px h-6 bg-slate-700 mx-1 self-center"></div>
 
-            {/* Boutons de suppression */}
             <button
               onClick={() => changeTool("Eraser")}
               className={`px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors ${activeTool === "Eraser" ? "bg-red-600 text-white" : "text-red-400 hover:bg-red-900/40 hover:text-red-300"}`}
@@ -438,14 +492,20 @@ export default function RadiologyViewer() {
           </div>
         </div>
 
-        {/* Colonne droite : Panneau de sauvegarde & PDF */}
         <div className="w-[380px] bg-slate-900 flex flex-col p-5 shadow-2xl z-10">
-          <div className="flex justify-between items-start mb-4 border-b border-slate-700 pb-4">
-            <div>
-              <h2 className="text-lg font-bold text-white">Dossier Médical</h2>
-              <p className="text-xs text-slate-400 mt-1">
-                Saisie des observations
-              </p>
+          <div className="flex flex-col mb-4 border-b border-slate-700 pb-4">
+            <h2 className="text-lg font-bold text-white mb-2">Dossier Médical</h2>
+            
+            <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 flex items-start gap-3">
+              <div className="mt-0.5 text-emerald-500">
+                <CheckCircleIcon fontSize="small" />
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 uppercase tracking-wider font-bold mb-1">Dernière modification</p>
+                <p className="text-sm text-white font-medium">
+                  {lastModifiedBy ? lastModifiedBy : "Aucun historique"}
+                </p>
+              </div>
             </div>
           </div>
 
