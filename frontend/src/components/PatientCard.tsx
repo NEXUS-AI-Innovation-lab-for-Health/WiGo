@@ -75,7 +75,7 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
 
     const checkExisting = async () => {
         try {
-            const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+            const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8002';
             const res = await fetch(`${apiUrl}/patients/${patient.folder_id}/extractions`);
             const data = await res.json();
             if (data && data.length > 0) {

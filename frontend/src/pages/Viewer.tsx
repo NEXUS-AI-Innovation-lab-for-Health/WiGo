@@ -163,7 +163,7 @@ export default function Viewer() {
 
   useEffect(() => {
     if (!rawUrl) return;
-    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8002";
     const finalTileSource = rawUrl.startsWith("http")
       ? rawUrl
       : `${baseUrl}/dzi_data/${rawUrl}`;
@@ -340,7 +340,7 @@ export default function Viewer() {
     setAiContours([]);
     setShowSidebar(true);
 
-    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8002";
 
     const payload = {
       filename: defaultDziFilename || "biopsie_cmu_1.dzi",
@@ -1121,7 +1121,7 @@ export default function Viewer() {
   useEffect(() => {
     if (extractionId) {
       setLoading(true);
-      const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+      const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8002";
       fetch(`${baseUrl}/extractions/${extractionId}/details`)
         .then((res) => res.json())
         .then((data) => {
@@ -1183,7 +1183,7 @@ export default function Viewer() {
   const handleSaveAction = async () => {
     if (!shapes.length && !extractionId) return;
     setLoading(true);
-    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+    const baseUrl = import.meta.env.VITE_API_URL || "http://localhost:8002";
     const shape = shapes.length > 0 ? shapes[0] : { x: 0, y: 0, w: 0, h: 0 };
 
     const payload = {

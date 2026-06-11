@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from minio import Minio
 from minio.error import S3Error
+import requests
 
 # --- IMPORT DU CLIENT INSTANSEG ---
 from instanseg_client import InstanSegClient
@@ -150,6 +151,23 @@ def seed_database(db: Session = Depends(database.get_db)):
         models.Base.metadata.drop_all(bind=database.engine)
         models.Base.metadata.create_all(bind=database.engine)
 
+        # 🌟 1. On interroge Orthanc pour récupérer les vrais ID de CE serveur
+        print("🔍 Récupération des études depuis Orthanc...")
+        orthanc_url = "http://orthanc:8042" # Utilise le nom du conteneur Docker !
+        
+        try:
+            # On demande la liste de toutes les études
+            response = requests.get(f"{orthanc_url}/studies", auth=("orthanc", "orthanc"))
+            if response.status_code == 200:
+                orthanc_studies = response.json()
+            else:
+                orthanc_studies = []
+                print(f"⚠️ Impossible de lire Orthanc (Code: {response.status_code})")
+        except Exception as e:
+            print(f"⚠️ Erreur de connexion à Orthanc: {e}")
+            orthanc_studies = []
+
+        # 🌟 2. On crée nos patients de base (pour la partie Biopsie)
         patients_data = [
             {
                 "name": "Jean Dupont",
@@ -159,10 +177,6 @@ def seed_database(db: Session = Depends(database.get_db)):
                 "family": "Non",
                 "med": "Hypertension",
                 "dzi_filename": "biopsie_cmu_1.dzi",
-                # 🌟 CORRECTION : On remet les vrais StudyInstanceUID pour la recherche DICOM !
-                "orthanc_id": "1.2.826.0.1.3680043.8.1055.1.20111103112244831.40200514.30965937",
-                "modality": "CT",
-                "desc": "Scanner Thoracique Complet",
             },
             {
                 "name": "Marie Curie",
@@ -172,9 +186,6 @@ def seed_database(db: Session = Depends(database.get_db)):
                 "family": "Oui",
                 "med": "Suivi annuel",
                 "dzi_filename": "biopsie_cmu_2.dzi",
-                "orthanc_id": "1.3.6.1.4.1.44316.6.102.1.20250704114423696.61158672119535771932",
-                "modality": "MR",
-                "desc": "IRM Mammaire Bilatérale",
             },
             {
                 "name": "Paul Martin",
@@ -184,13 +195,12 @@ def seed_database(db: Session = Depends(database.get_db)):
                 "family": "Non",
                 "med": "RAS",
                 "dzi_filename": "biopsie_cmu_3.dzi",
-                "orthanc_id": "1.3.12.2.1107.5.4.3.123456789012345.19950922.121803.6",
-                "modality": "CR",
-                "desc": "Radiographie Standard",
             },
         ]
 
-        count = 0
+        # On sauvegarde les patients créés pour pouvoir leur lier des radios ensuite
+        created_patients = []
+        
         for p in patients_data:
             patient = models.Patient(
                 name=p["name"],
@@ -203,24 +213,50 @@ def seed_database(db: Session = Depends(database.get_db)):
             db.add(patient)
             db.commit()
             db.refresh(patient)
+            created_patients.append(patient)
 
             biopsy = models.Biopsy(
                 patient_id=patient.id, image_url=p["dzi_filename"], status="Non analysé"
             )
             db.add(biopsy)
+            db.commit()
+
+        # 🌟 3. On associe dynamiquement les radios d'Orthanc aux patients
+        print(f"📸 {len(orthanc_studies)} études trouvées dans Orthanc.")
+        
+        for index, study_id in enumerate(orthanc_studies):
+            # On répartit les radios sur nos 3 patients (s'il y a plus de 3 radios, ça boucle)
+            target_patient = created_patients[index % len(created_patients)]
+            
+            # On va chercher les détails de l'étude dans Orthanc (pour la modalité)
+            study_details_url = f"{orthanc_url}/studies/{study_id}"
+            try:
+                details_res = requests.get(study_details_url, auth=("orthanc", "orthanc"))
+                if details_res.status_code == 200:
+                    details = details_res.json()
+                    # On extrait la modalité si elle existe (CT, MR, CR...)
+                    modality = details.get("PatientMainDicomTags", {}).get("Modality", "Inconnue")
+                    study_desc = details.get("MainDicomTags", {}).get("StudyDescription", "Examen Radiologique")
+                else:
+                    modality = "Inconnue"
+                    study_desc = "Examen Radiologique"
+            except:
+                modality = "Inconnue"
+                study_desc = "Examen Radiologique"
 
             radio = models.RadiologyStudy(
-                patient_id=patient.id,
-                orthanc_study_id=p["orthanc_id"],
-                modality=p["modality"],
-                description=p["desc"],
-                date="2026-04-10",
+                patient_id=target_patient.id,
+                orthanc_study_id=study_id, 
+                modality=modality,
+                description=study_desc,
+                date="2026-06-11",
             )
             db.add(radio)
-            count += 1
+            print(f"🔗 Lié: Patient {target_patient.name} <-> Radio {study_id}")
 
         db.commit()
-        return {"message": f"Succès ! BDD Réinitialisée."}
+        return {"message": f"Succès ! BDD Réinitialisée avec {len(orthanc_studies)} études liées."}
+    
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -285,12 +321,12 @@ async def analyze_image_with_ai(data: AnalysisPayload):
         source_name = "CMU-1.svs"
     elif data.patient_folder == "CASE-InstanSeg-HE":
         source_name = "HE_example.tif"
-    elif data.patient_folder == "CMU-2":  # 🌟 Changé !
+    elif data.patient_folder == "CMU-2": 
         source_name = "CMU-2.svs"
     else:
         source_name = "CMU-1.svs"  # Fallback
 
-    source_path = f"/app/{source_name}"
+    source_path = f"/app/images_initiales/biopsie/{source_name}"
     if not os.path.exists(source_path):
         raise HTTPException(
             status_code=404, detail=f"Image source introuvable: {source_name}"
@@ -448,7 +484,7 @@ def extract_roi(data: AnalysisPayload, db: Session = Depends(database.get_db)):
     else:
         source_minio_name = "CMU-1.svs"
 
-    source_path = f"/app/{source_minio_name}"
+    source_path = f"/app/images_initiales/biopsie/{source_minio_name}"
 
     if not os.path.exists(source_path):
         print(f"📥 L'image source n'est pas en local. Téléchargement depuis MinIO...")
@@ -590,7 +626,7 @@ def get_extractions(folder_id: str, db: Session = Depends(database.get_db)):
             {
                 "id": e.id,
                 "filename": e.label,
-                "url": f"http://localhost:8000/dzi_data/{e.dzi_url}",
+                "url": f"http://localhost:8002/dzi_data/{e.dzi_url}",
                 "roi": {"x": e.x, "y": e.y, "w": e.w, "h": e.h},
                 "diagnosis": e.diagnosis,
                 "status": e.status,

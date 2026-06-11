@@ -1,68 +1,56 @@
-# 🔬 WiGo - Plateforme d'Analyse Collaborative de Biopsies
+# 🔬 WiGo / OncoCollab - Plateforme Multimodale d'Imagerie Médicale & IA
 
-**WiGo** est une solution de **Pathologie Numérique** assistée par ordinateur. Elle permet la conversion, la visualisation et l'annotation collaborative d'images de biopsies haute résolution (Whole Slide Imaging).
+**WiGo** est une solution avancée de **Dossier Patient Informatisé (DPI) et de Pathologie Numérique**. Elle permet la visualisation centralisée, l'annotation collaborative et l'analyse par Intelligence Artificielle d'images médicales complexes, allant de la radiologie classique (DICOM) aux biopsies haute résolution (Whole Slide Imaging).
 
-Conçue pour les workflow médicaux complexes, elle assure la transition entre le stockage froid (MinIO) et la visualisation web instantanée (Deep Zoom) grâce à une architecture microservices robuste.
+Conçue pour s'intégrer dans des workflows médicaux comme OncoCollab, elle assure la transition fluide entre le stockage froid (MinIO / Orthanc) et la visualisation web instantanée grâce à une architecture microservices robuste et automatisée.
 
 ---
 
 ## 🚀 Fonctionnalités Clés
 
-### 1. Visualisation Ultra-Performante
+### 1. Imagerie Multimodale (Radiologie & Biopsie)
 
-* **Format Deep Zoom (DZI) :** Affichage fluide d'images gigapixels sans temps de chargement, grâce au tuilage pyramidal.
-* **Support SVS :** Prise en charge native des fichiers scanners standards (Aperio .svs).
-* **Navigation :** Zoom profond, panoramique et mini-map contextuelle via **OpenSeadragon**.
+* **Module Radiologie (PACS) :** Intégration native avec un serveur **Orthanc** pour le stockage et la distribution des fichiers DICOM. Visualisation performante via **Cornerstone.js** (Contraste, Pan, Zoom, Mesures, Export PDF).
+* **Module Biopsie (WSI) :** Affichage fluide d'images gigapixels au format Deep Zoom (DZI) sans temps de chargement via **OpenSeadragon**. Support natif des fichiers scanners standards (.svs, .tif).
 
-### 2. Collaboration Médicale Sécurisée
+### 2. Analyse par Intelligence Artificielle (InstanSeg)
 
-* **Gestion des Rôles :**
+* **Segmentation Cellulaire :** Intégration d'un microservice IA dédié (**InstanSeg** / PyTorch) permettant la détection et la segmentation des noyaux cellulaires en temps réel.
+* **Bilan Automatique :** Calcul instantané de la densité cellulaire, de la surface moyenne et évaluation du pléomorphisme nucléaire sur les zones d'intérêt (ROI) sélectionnées par le médecin.
+
+### 3. Collaboration Médicale Sécurisée
+
+* **Gestion des Rôles et Annotations :**
 * **Mes annotations (Vert) :** Modifiables et supprimables.
-* **Annotations Confrères (Orange) :** Lecture seule, affichage du nom de l'auteur.
+* **Annotations Confrères (Orange) :** Lecture seule, affichage du nom et de la profession de l'auteur.
 
 
-* **Sécurité des Données :** Impossible de supprimer ou d'altérer le diagnostic d'un autre médecin.
-* **Workflow Clinique :** Suivi du statut des analyses (En cours, Terminé, Archivé) et formulaires pathologiques standardisés (Grade SBR, H&E/IHC, etc.).
+* **Sécurité des Données :** Impossible de supprimer ou d'altérer le compte-rendu ou le diagnostic d'un autre médecin.
 
-### 3. Dashboard Analytique
+### 4. Dashboard Analytique
 
-* **Statistiques en temps réel :** Graphiques (Recharts) montrant la répartition des cas (Sains vs Critiques) et l'activité hebdomadaire.
-* **File d'attente intelligente :** Accès conditionnel aux dossiers (Bouton "Ouvrir" uniquement si une extraction existe).
+* **Vue Unifiée :** Liste des patients intégrant dynamiquement leurs historiques de biopsies et leurs études radiologiques.
+* **Statistiques en temps réel :** Graphiques de répartition des cas et suivi de l'activité.
 
 ---
 
-## 🏗️ Architecture Technique : Le Pipeline SVS → DZI
+## 🏗️ Architecture Technique et Flux de Données
 
-L'innovation principale de WiGo réside dans sa gestion des fichiers lourds. Le navigateur ne peut pas lire un fichier `.svs` de 2Go directement. Nous utilisons un pipeline de conversion asynchrone.
+WiGo repose sur un pipeline entièrement automatisé ("Plug & Play") géré par Docker.
 
-### Comprendre le Flux de Données
+### 1. Le Stockage Froid et l'Auto-Injection (`image_seeder`)
 
-1. **Le Coffre-Fort (MinIO / S3) :**
-* Stocke le fichier original **`CMU-1.svs`** (la "source brute").
-* C'est la référence légale et médicale inaltérable.
+* Les images brutes sont placées dans le dossier local `images_initiales/`.
+* Au lancement de Docker, le script `seed_images.py` s'active : il route automatiquement les fichiers DICOM vers le serveur **Orthanc** et les fichiers WSI (SVS/TIF) vers le bucket **MinIO**.
 
+### 2. La Synchronisation (`/seed`)
 
-2. **Le Convertisseur (Backend Python) :**
-* Au démarrage, le script `generate_dzi.py` télécharge le fichier depuis MinIO.
-* Il utilise **LibVips (PyVips)** pour découper l'image en milliers de petites tuiles `.jpeg`.
+* La route API `POST /seed` interroge le serveur Orthanc pour récupérer ses identifiants internes dynamiques et lie automatiquement les études radiologiques et les biopsies aux dossiers patients dans **PostgreSQL**.
 
+### 3. Le Traitement à la volée (Biopsies)
 
-3. **Le Serveur de Tuiles (Volume Docker) :**
-* Le résultat est stocké dans `backend/dzi_data/`.
-* Il contient un fichier manifeste `.dzi` (XML) et un dossier `_files` avec les niveaux de zoom (0 à 16).
-
-
-4. **Le Visualiseur (Frontend React) :**
-* OpenSeadragon ne télécharge pas l'image entière. Il requête uniquement les petites tuiles `.jpeg` correspondant à la zone que le médecin regarde.
-
-
-
-> **En résumé :**
-> * **MinIO** = La "Vache" entière (Stockage froid).
-> * **DZI/Local** = Les "Steaks hachés" prêts à consommer (Stockage chaud).
-> * **Viewer** = Le Client qui consomme les tuiles à la demande.
-> 
-> 
+* **Le Convertisseur :** Le backend télécharge les fichiers depuis MinIO et utilise **PyVips** pour découper l'image en milliers de tuiles `.jpeg`.
+* **Le Visualiseur :** OpenSeadragon requête uniquement les tuiles correspondant à la zone visionnée (Deep Zoom).
 
 ---
 
@@ -70,12 +58,13 @@ L'innovation principale de WiGo réside dans sa gestion des fichiers lourds. Le 
 
 | Couche | Technologies |
 | --- | --- |
-| **Frontend** | React 18, TypeScript, Vite, TailwindCSS, Material UI, OpenSeadragon |
-| **Backend** | Python 3.10, FastAPI, SQLAlchemy, Pydantic |
-| **Traitement** | **PyVips** (Traitement d'images haute performance) |
-| **Base de Données** | **PostgreSQL 15** (Données structurées & Annotations JSON) |
-| **Stockage Objet** | **MinIO** (Compatible Amazon S3) |
-| **Infra** | Docker, Docker Compose |
+| **Frontend** | React 18, TypeScript, Vite, TailwindCSS, **Cornerstone.js**, **OpenSeadragon** |
+| **Backend** | Python 3.10, FastAPI (Port 8002), SQLAlchemy, Pydantic |
+| **Intelligence Artificielle** | **InstanSeg** (PyTorch, Port 7000) |
+| **PACS (Radiologie)** | **Orthanc** (Port 8042) |
+| **Stockage Objet (Biopsie)** | **MinIO** (Compatible Amazon S3, Port 9000) |
+| **Base de Données** | **PostgreSQL 15** |
+| **Infra & DevOps** | Docker, Docker Compose |
 
 ---
 
@@ -83,97 +72,64 @@ L'innovation principale de WiGo réside dans sa gestion des fichiers lourds. Le 
 
 ### Prérequis
 
-* **Docker & Docker Compose :** Assurez-vous que Docker Desktop est installé et en cours d'exécution. Téléchargez-le depuis [docker.com](https://www.docker.com/products/docker-desktop) si nécessaire.
-* **Fichiers de biopsie :** Un fichier de biopsie nommé **`CMU-1.svs`** doit être placé dans le dossier `backend/` (ou configuré dans votre bucket MinIO). Pour la démo, des fichiers exemples sont inclus.
-* **Ressources système :** Au moins 8GB RAM et 10GB d'espace disque libre pour la conversion d'images.
-* **Navigateur web :** Chrome, Firefox ou Edge pour une compatibilité optimale avec OpenSeadragon.
+* **Docker & Docker Compose :** Installé et en cours d'exécution.
+* **Ressources système :** Au moins 8GB RAM et de l'espace disque libre pour la conversion d'images et les modèles IA.
 
-### Configuration
+### 1. Préparation des Images
 
-Avant de lancer le projet, vérifiez les fichiers de configuration :
+Avant de lancer le projet, placez vos images de test dans l'arborescence suivante à la racine du projet :
 
-* **`docker-compose.yml` :** Définit les services (backend, frontend, db, minio). Modifiez les ports si nécessaire (par défaut : 8000 pour backend, 5173 pour frontend, 5432 pour PostgreSQL, 9000/9001 pour MinIO).
-* **Variables d'environnement :** Dans `docker-compose.yml`, ajustez les variables comme `POSTGRES_PASSWORD`, `MINIO_ACCESS_KEY`, etc., pour la sécurité en production.
-* **Backend :** Le fichier `backend/main.py` contient les routes API. Pour le développement, vous pouvez modifier les endpoints ou ajouter de nouvelles fonctionnalités.
-* **Frontend :** Le fichier `frontend/vite.config.ts` configure le proxy pour l'API backend.
-
-Pour une configuration avancée, consultez la documentation de chaque service (FastAPI, React, PostgreSQL, MinIO).
-
-### 1. Lancement
-
-```bash
-# Construire et lancer les conteneurs
-docker compose up -d --build
+```text
+images_initiales/
+├── radiologie/     # Placez ici vos fichiers DICOM (.dcm)
+└── biopsie/        # Placez ici vos fichiers WSI (.svs, .tif)
 
 ```
 
-### 2. Initialisation (Seed)
+### 2. Lancement
 
-Pour peupler la base de données avec des médecins et des patients fictifs :
+Lancez la construction et le démarrage de l'ensemble des microservices :
 
-* **Via l'API :** `POST http://localhost:8000/seed`
-* **Via Swagger :** Allez sur [http://localhost:8000/docs](https://www.google.com/search?q=http://localhost:8000/docs), cherchez `/seed` et cliquez sur "Execute".
+```bash
+docker compose up --build
 
-### 3. Accès
+```
 
-* **Frontend (App) :** [http://localhost:5173](https://www.google.com/search?q=http://localhost:5173)
-* **Backend (Docs) :** [http://localhost:8000/docs](https://www.google.com/search?q=http://localhost:8000/docs)
-* **MinIO (Console) :** [http://localhost:9001](https://www.google.com/search?q=http://localhost:9001)
+*Patientez environ 15 secondes après le démarrage des bases de données pour laisser le script `image_seeder` distribuer vos images dans MinIO et Orthanc.*
 
-### Développement Local
+### 3. Initialisation de la Base de Données (Seed)
 
-Si vous souhaitez développer sans Docker ou personnaliser le code :
+Une fois les images injectées, peuplez la base de données PostgreSQL pour lier les images aux patients :
 
-1. **Backend (Python) :**
-   - Installez Python 3.10+.
-   - Créez un environnement virtuel : `python -m venv backend/.venv`
-   - Activez-le : `backend\.venv\Scripts\activate` (Windows) ou `source backend/.venv/bin/activate` (Linux/Mac)
-   - Installez les dépendances : `pip install -r backend/requirements.txt`
-   - Lancez le serveur : `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`
+* **Via Swagger :** Allez sur [http://localhost:8002/docs](http://localhost:8002/docs)
+* Cherchez la route **`POST /seed`**, cliquez sur "Try it out" puis "Execute".
 
-2. **Frontend (React) :**
-   - Installez Node.js 18+ et npm.
-   - Installez les dépendances : `cd frontend && npm install`
-   - Lancez le serveur de développement : `npm run dev`
-   - L'app sera accessible sur [http://localhost:5173](http://localhost:5173)
+### 4. Accès
 
-3. **Base de données :** Utilisez PostgreSQL local ou un conteneur séparé. Configurez la connexion dans `backend/main.py`.
-
-4. **MinIO :** Lancez un serveur MinIO local ou utilisez un bucket cloud. Configurez les credentials dans le code.
-
-Pour déboguer, consultez les logs des conteneurs avec `docker compose logs -f [service]`.
+* **Frontend (App) :** [http://localhost:5173](http://localhost:5173)
+* **Backend (Swagger API) :** [http://localhost:8002/docs](http://localhost:8002/docs)
+* **MinIO (Console) :** [http://localhost:9001](http://localhost:9001) *(User/Pass: minioadmin)*
+* **Orthanc (PACS) :** [http://localhost:8042](http://localhost:8042)
 
 ---
 
 ## 📖 Guide du Médecin (Démo)
 
-1. **Connexion :** Entrez un nom d'utilisateur (ex: "Dr. House").
-2. **Dashboard :** Sélectionnez le patient "Jean Dupont" (ID: CMU-1).
-3. **Nouvelle Analyse :** Cliquez sur "Nouvelle" pour générer une extraction.
-4. **Annotation :**
-* Utilisez les outils (Rectangle, Cercle) pour marquer une zone.
-* Remplissez le formulaire à droite (Diagnostic, Observations).
-* Cliquez sur **"Créer l'extraction"**.
+1. **Connexion :** Entrez un nom d'utilisateur (ex: "Dr. House") et votre spécialité.
+2. **Dashboard :** Visualisez la liste des patients. Cliquez sur une étude radiologique ou une biopsie.
+3. **Radiologie :**
+* Utilisez les outils de la barre supérieure (Contraste, Mesures, Gomme).
+* Rédigez votre compte-rendu.
+* Exportez le tout en PDF.
 
 
-5. **Simulation Collaboration :**
-* Ouvrez une nouvelle fenêtre privée.
-* Connectez-vous en tant que "Dr. Wilson".
-* Ouvrez le même dossier. Vous verrez les annotations du Dr. House en **Orange** (Lecture seule).
-* Ajoutez une annotation par-dessus : elle sera en **Vert** (Votre propriété).
+4. **Biopsie & IA :**
+* Naviguez dans la lame virtuelle.
+* Sélectionnez "Nouvelle Extraction".
+* Dessinez un rectangle sur une zone suspecte (max 1500x1500px) et cliquez sur "Générer Rapport IA".
+* InstanSeg analysera la zone et détourera les noyaux cellulaires en fournissant un bilan clinique.
 
-### APIs Principales
 
-WiGo expose une API REST via FastAPI. Voici les endpoints clés :
-
-* **GET /patients** : Liste tous les patients.
-* **GET /patients/{id}** : Détails d'un patient spécifique.
-* **POST /extractions** : Crée une nouvelle extraction/annotation.
-* **GET /extractions/{patient_id}** : Liste les extractions pour un patient.
-* **POST /seed** : Initialise la base de données avec des données fictives.
-* **GET /dzi/{filename}** : Sert les fichiers DZI pour la visualisation.
-
-Consultez la documentation complète sur [http://localhost:8000/docs](http://localhost:8000/docs) après lancement.
 
 ---
 
@@ -182,19 +138,23 @@ Consultez la documentation complète sur [http://localhost:8000/docs](http://loc
 ```text
 Projet6/
 ├── backend/
-│   ├── dzi_data/           # Volume partagé contenant les tuiles générées
-│   │   ├── CMU-1/          # Dossier par patient
-│   │   └── biopsie_cmu_1.dzi
+│   ├── dzi_data/           # Volume partagé contenant les tuiles générées (DZI)
 │   ├── main.py             # API FastAPI (Routes & Logique)
-│   ├── generate_dzi.py     # Script ETL (MinIO -> PyVips -> DZI)
+│   ├── seed_images.py      # Script auto-injection MinIO & Orthanc
+│   ├── generate_dzi.py     # Script ETL (PyVips -> DZI)
 │   ├── models.py           # Schémas de Base de données (SQLAlchemy)
 │   └── Dockerfile
 ├── frontend/
 │   ├── src/
-│   │   ├── components/     # Viewer, Dashboard, PatientCard...
+│   │   ├── components/     # Composants React (PatientCard, etc.)
+│   │   ├── pages/          # Vues principales (RadiologyViewer, Viewer Biopsie...)
 │   │   └── services/       # Appels API (Axios/Fetch)
 │   └── Dockerfile
-└── docker-compose.yml      # Orchestration
+├── instanseg/              # Microservice IA (PyTorch)
+├── images_initiales/       # Dossier source pour l'injection automatique
+│   ├── biopsie/
+│   └── radiologie/
+└── docker-compose.yml      # Orchestration des 7 conteneurs
 
 ```
 
@@ -204,18 +164,10 @@ Projet6/
 
 ### Problèmes Courants
 
-* **Erreur de build Docker :** Assurez-vous que Docker Desktop est en cours d'exécution et que vous avez suffisamment d'espace disque. Essayez `docker system prune` pour nettoyer.
-* **Port déjà utilisé :** Modifiez les ports dans `docker-compose.yml` si 8000, 5173, etc., sont occupés.
-* **Fichier SVS manquant :** Placez `CMU-1.svs` dans `backend/`. Pour tester, utilisez les fichiers exemples fournis.
-* **Conversion DZI échoue :** Vérifiez les logs avec `docker compose logs backend`. Assurez-vous que PyVips est installé dans le conteneur.
-* **Annotations non sauvegardées :** Vérifiez la connexion à PostgreSQL. Les données sont persistées dans un volume Docker.
-* **Performance lente :** La conversion initiale peut prendre du temps. Pour les gros fichiers, augmentez la RAM allouée à Docker.
-
-### Logs et Debugging
-
-* **Logs des conteneurs :** `docker compose logs [service]` (ex: `docker compose logs backend`)
-* **Accès au conteneur :** `docker compose exec backend bash`
-* **Redémarrage :** `docker compose restart`
+* **"Aucun patient trouvé" ou "Failed to fetch" :** Vérifiez que le port de l'API dans le frontend (`api.ts` ou `import.meta.env.VITE_API_URL`) pointe bien sur `http://localhost:8002` et non 8000.
+* **Erreur d'accès aux dossiers images_initiales :** Assurez-vous d'avoir bien créé les dossiers `biopsie` et `radiologie` comme indiqué à l'étape 1, même s'ils sont vides.
+* **L'IA ne répond pas (Port 7000) :** InstanSeg télécharge ses modèles PyTorch au premier lancement, ce qui peut prendre quelques minutes selon votre connexion. Vérifiez les logs avec `docker compose logs instanseg`.
+* **Écran noir en Radiologie :** Vérifiez que le script `/seed` a bien été exécuté après l'injection des fichiers DICOM, afin que l'ID Orthanc corresponde à l'ID en base de données.
 
 ---
 
@@ -223,39 +175,12 @@ Projet6/
 
 **⚠️ Important :** WiGo est une plateforme de démonstration technique. Elle n'est pas destinée à un usage médical réel sans validation réglementaire.
 
-* **Confidentialité :** Les données médicales sont sensibles. En production, chiffrez les communications (HTTPS) et stockez les données de manière sécurisée.
-* **RGPD/Conformité :** Implémentez l'anonymisation des données et le consentement des patients.
-* **Authentification :** Actuellement simplifiée pour la démo. En production, utilisez OAuth2, JWT sécurisés, ou intégration LDAP.
-* **Audit :** Les annotations sont traçables par auteur, mais ajoutez des logs d'audit complets.
-* **Sauvegarde :** Configurez des sauvegardes régulières pour PostgreSQL et MinIO.
-
-Pour une implémentation en production, consultez les normes HIPAA, RGPD, ou équivalents locaux.
-
----
-
-## 🤝 Contribution
-
-Nous accueillons les contributions ! Pour participer :
-
-1. **Fork** le repository.
-2. **Clone** votre fork : `git clone https://github.com/votre-username/Projet6.git`
-3. **Créez une branche** : `git checkout -b feature/nouvelle-fonctionnalite`
-4. **Développez** et testez vos changements.
-5. **Commit** : `git commit -m "Ajout de [description]"`
-6. **Push** : `git push origin feature/nouvelle-fonctionnalite`
-7. **Pull Request** : Ouvrez une PR avec une description détaillée.
-
-### Guidelines
-
-* Suivez les conventions de code (PEP8 pour Python, ESLint pour JS/TS).
-* Ajoutez des tests pour les nouvelles fonctionnalités.
-* Mettez à jour la documentation si nécessaire.
-* Respectez la sécurité des données médicales.
+* **Confidentialité :** En production, chiffrez les communications (HTTPS) et isolez le serveur Orthanc derrière un reverse proxy.
+* **Orthanc "Insecure setup" :** Le message d'avertissement d'Orthanc au lancement est normal en environnement de développement local (authentification basique activée sans utilisateurs déclarés complexes).
+* **RGPD :** Implémentez l'anonymisation des tags DICOM avant l'envoi en production.
 
 ---
 
 ## 📄 Licence
 
 Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
-
-**WiGo** - *Plateforme de démonstration technique pour l'analyse de biopsies.*

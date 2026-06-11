@@ -64,7 +64,7 @@ services:
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
-      - MINIO_BUCKET_NAME=biopsies
+      - MINIO_BUCKET_NAME=biopsie
     depends_on:
       - postgres
       - minio
@@ -99,6 +99,20 @@ services:
       - "5173:5173"
     environment:
       - VITE_API_URL=http://localhost:8002
+    networks:
+      - app_network
+
+  # --- Auto-Injection des Images ---
+  image_seeder:
+    build: ./backend
+    container_name: p6_image_seeder
+    command: python seed_images.py
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - backend
+      - orthanc
+      - minio
     networks:
       - app_network
 

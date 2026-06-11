@@ -115,7 +115,7 @@ export default function RadiologyViewer({
     const loadDataAndDicom = async () => {
       try {
         const dbRes = await fetch(
-          `http://localhost:8000/radiology/${studyId}/report`,
+          `http://localhost:8002/radiology/${studyId}/report`,
         );
         const dbData = await dbRes.json();
         
@@ -250,7 +250,7 @@ export default function RadiologyViewer({
 
     try {
       const res = await fetch(
-        `http://localhost:8000/radiology/${studyId}/report`,
+        `http://localhost:8002/radiology/${studyId}/report`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -307,7 +307,7 @@ export default function RadiologyViewer({
       const doctorSignature = `${finalUser.name} (${finalUser.profession})`;
 
       const res = await fetch(
-        `http://localhost:8000/radiology/${studyId}/report`,
+        `http://localhost:8002/radiology/${studyId}/report`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

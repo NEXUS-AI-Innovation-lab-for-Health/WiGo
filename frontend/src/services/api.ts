@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // L'adresse de ton backend Python
-const API_URL = 'http://127.0.0.1:8000';
+const API_URL = 'http://127.0.0.1:8002';
 
 export interface Biopsy {
   id: number;

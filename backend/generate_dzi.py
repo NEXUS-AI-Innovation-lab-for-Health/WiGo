@@ -7,9 +7,9 @@ OUTPUT_DIR = "dzi_data"
 
 # Liste des images à convertir (Fichier source, Nom de base de sortie)
 IMAGES_TO_PROCESS = [
-    ("CMU-1.svs", "biopsie_cmu_1"),
-    ("HE_example.tif", "biopsie_cmu_2"),          
-    ("CMU-2.svs", "biopsie_cmu_3") # 🌟 On a remplacé la fluo par CMU-2 !
+    ("images_initiales/biopsie/CMU-1.svs", "biopsie_cmu_1"),
+    ("images_initiales/biopsie/HE_example.tif", "biopsie_cmu_2"),          
+    ("images_initiales/biopsie/CMU-2.svs", "biopsie_cmu_3") 
 ]
 
 def clean_directory(directory):
