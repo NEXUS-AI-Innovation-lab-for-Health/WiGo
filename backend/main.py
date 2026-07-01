@@ -576,7 +576,12 @@ def update_analysis(data: AnalysisPayload, db: Session = Depends(database.get_db
     )
     if not ext:
         raise HTTPException(status_code=404, detail="Introuvable")
+    
     sc = data.slide_count if isinstance(data.slide_count, int) else None
+    
+    # 🌟 CORRECTION CRUCIALE : Enregistrement du nouveau nom de l'extraction !
+    ext.label = data.annotation_label 
+    
     ext.prelevement_type = data.prelevement_type
     ext.prelevement_date = data.prelevement_date
     ext.block_number = data.block_number
@@ -594,6 +599,7 @@ def update_analysis(data: AnalysisPayload, db: Session = Depends(database.get_db
     ext.status = data.status
     ext.pathologist = data.pathologist
     ext.validation_date = data.validation_date
+    
     db.query(models.Drawing).filter(models.Drawing.extraction_id == ext.id).delete()
     for d in data.drawings:
         new_draw = models.Drawing(
@@ -626,6 +632,7 @@ def get_extractions(folder_id: str, db: Session = Depends(database.get_db)):
             {
                 "id": e.id,
                 "filename": e.label,
+                "annotation_label": e.label, # 🌟 CORRECTION : Renvoi propre pour le Dashboard
                 "url": f"http://localhost:8002/dzi_data/{e.dzi_url}",
                 "roi": {"x": e.x, "y": e.y, "w": e.w, "h": e.h},
                 "diagnosis": e.diagnosis,
@@ -648,6 +655,7 @@ def get_details(extraction_id: int, db: Session = Depends(database.get_db)):
     return {
         "id": ext.id,
         "filename": ext.label,
+        "annotation_label": ext.label, # 🌟 CORRECTION : Renvoi propre pour le Viewer
         "prelevement_type": ext.prelevement_type,
         "prelevement_date": ext.prelevement_date,
         "block_number": ext.block_number,

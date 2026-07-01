@@ -93,10 +93,18 @@ export default function Viewer() {
 
   const [showTexts, setShowTexts] = useState(true);
 
+  // --- ÉTAT DU WORKFLOW (MOCKÉ) ---
+  const MOCK_FORM_IDS = [
+    "a44b3f32-1e4c-4686-9705-6ca67a381c88", // Étape 1 - Prélèvement
+    "a42b3f12-1e4c-7636-9705-6ca87a381c93", // Étape 2 - Préparation
+    "a13b3f32-1e4c-0000-2189-6ca67a381c03", // Étape 3 - Microscopie
+    "a81b3f32-1e4c-8888-2222-9ca27a381c03"  // Étape 4 - Diagnostic
+  ];
+  const [currentStep, setCurrentStep] = useState<number>(0);
+  const [isWorkflowFinished, setIsWorkflowFinished] = useState<boolean>(false);
+
   // --- ÉTAT DU FORMULAIRE OLGA ---
-  const [olgaFormSchema, setOlgaFormSchema] = useState<OlgaFormSchema | null>(
-    null,
-  );
+  const [olgaFormSchema, setOlgaFormSchema] = useState<OlgaFormSchema | null>(null);
 
   const [formData, setFormData] = useState<Record<string, unknown>>({
     prelevementType: "fine",
@@ -119,38 +127,38 @@ export default function Viewer() {
   });
 
   const [labelInput, setLabelInput] = useState("Extraction");
-  const [selectedShapeIndex, setSelectedShapeIndex] = useState<number | null>(
-    null,
-  );
+  const [selectedShapeIndex, setSelectedShapeIndex] = useState<number | null>(null);
 
   // Outils
   const [currentTool, setCurrentTool] = useState<ToolType>("move");
   const [shapes, setShapes] = useState<Shape[]>([]);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(
-    null,
-  );
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [currentDragShape, setCurrentDragShape] = useState<Shape | null>(null);
   const [movingShapeIndex, setMovingShapeIndex] = useState<number | null>(null);
   const [movingTextIndex, setMovingTextIndex] = useState<number | null>(null);
 
   const [polyPoints, setPolyPoints] = useState<{ x: number; y: number }[]>([]);
-  const [pendingTextPos, setPendingTextPos] = useState<{
-    x: number;
-    y: number;
-  } | null>(null);
-  const [editingShapeIndex, setEditingShapeIndex] = useState<number | null>(
-    null,
-  );
+  const [pendingTextPos, setPendingTextPos] = useState<{ x: number; y: number } | null>(null);
+  const [editingShapeIndex, setEditingShapeIndex] = useState<number | null>(null);
   const [textValue, setTextValue] = useState("");
 
   const viewerRef = useRef<OpenSeadragon.Viewer | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // --- CHARGEMENT DU FORMULAIRE OLGA COURANT ---
   useEffect(() => {
-    const fetchOlgaForm = async () => {
+    if (!isAnnotationMode) return;
+
+    const fetchCurrentForm = async () => {
+      if (isWorkflowFinished) {
+        setOlgaFormSchema(null);
+        return;
+      }
+
       try {
+        const currentFormId = MOCK_FORM_IDS[currentStep];
         const response = await fetch(
-          "http://localhost:9091/forms/getFromID/a44b3f32-4e4c-4486-9705-6ca67a381c53",
+          `http://localhost:9091/forms/getFromID/${currentFormId}`
         );
         const data = await response.json();
         setOlgaFormSchema(data);
@@ -158,8 +166,9 @@ export default function Viewer() {
         console.error("Erreur connexion API OLGA:", error);
       }
     };
-    fetchOlgaForm();
-  }, []);
+
+    fetchCurrentForm();
+  }, [currentStep, isWorkflowFinished, isAnnotationMode]);
 
   useEffect(() => {
     if (!rawUrl) return;
@@ -208,8 +217,6 @@ export default function Viewer() {
           if (isAnnotationMode) {
             setTimeout(() => {
               const homeZoom = viewer.viewport.getZoom();
-
-              // 🌟 CORRECTION ICI : Le dézoom minimum est strictement bloqué sur la vue de l'extraction
               const minZoom = homeZoom;
               const maxZoom = Math.max(2.5, homeZoom * 8);
 
@@ -316,7 +323,6 @@ export default function Viewer() {
         ? shapes[targetShapeIndex]
         : { type: "rect" as ToolType, x: 5000, y: 5000, w: 1000, h: 1000 };
 
-    // Calculer le coin Haut-Gauche pour l'IA ---
     const { minX, minY, maxX, maxY } = getShapeBounds(shape);
     const cropX = Math.round(minX);
     const cropY = Math.round(minY);
@@ -365,7 +371,6 @@ export default function Viewer() {
         const data = (await response.json()) as InstanSegResult;
         setAiSuggestion(data.suggestion);
 
-        // --- ON STOCKE LES POLYGONES AI AVEC DÉCALAGE (cropX et cropY) ---
         const contours = (data.contour_points || [])
           .filter(
             (blob) => Array.isArray(blob.points) && blob.points.length > 2,
@@ -465,7 +470,6 @@ export default function Viewer() {
   };
 
   const handleShapeMouseDown = (e: React.MouseEvent, index: number) => {
-    // MAGIE : On mémorise la forme cliquée pour l'IA !
     setSelectedShapeIndex(index);
 
     if (currentTool === "text") {
@@ -496,7 +500,6 @@ export default function Viewer() {
     if (!viewerRef.current) return;
     if (editingShapeIndex !== null) return;
 
-    // Si on clique dans le vide avec l'outil de déplacement, on annule la sélection
     if (currentTool === "move" && !pendingTextPos) {
       setSelectedShapeIndex(null);
       return;
@@ -515,7 +518,6 @@ export default function Viewer() {
       return;
     }
 
-    // Si on commence à dessiner une nouvelle forme, on la présélectionnera plus tard
     setDragStart({ x, y });
     setCurrentDragShape({ type: currentTool, x, y, w: 0, h: 0 });
   };
@@ -524,7 +526,6 @@ export default function Viewer() {
     if (!dragStart) return;
     const { x: currentX, y: currentY } = getCoords(e);
 
-    // --- DEPLACEMENT DES TEXTES LIES (AUTORISÉ) ---
     if (movingTextIndex !== null && viewerRef.current) {
       const shape = shapes[movingTextIndex];
       const pStart = viewerRef.current.viewport.viewerElementToImageCoordinates(
@@ -582,7 +583,6 @@ export default function Viewer() {
       return;
     }
 
-    // --- DEPLACEMENT DES TEXTES LIBRES (AUTORISÉ) ---
     if (movingShapeIndex !== null && viewerRef.current) {
       const shape = shapes[movingShapeIndex];
 
@@ -612,7 +612,6 @@ export default function Viewer() {
       return;
     }
 
-    // --- CREATION DE NOUVELLES FORMES ---
     if (currentDragShape) {
       const w = Math.abs(currentX - dragStart.x);
       const h = Math.abs(currentY - dragStart.y);
@@ -775,7 +774,6 @@ export default function Viewer() {
     setTextValue(shapes[index].text || "");
   };
 
-  // 1️⃣ COUCHE DE FOND : DESSINE UNIQUEMENT LES FORMES (Rectangles, Cercles...)
   const renderShapesBackground = () => {
     if (!viewerRef.current) return null;
     return shapes.map((shape, idx) => {
@@ -906,7 +904,6 @@ export default function Viewer() {
     });
   };
 
-  // 2️⃣ COUCHE PREMIER PLAN : DESSINE UNIQUEMENT LES TEXTES ET LIGNES POINTILLÉES
   const renderTextOverlays = () => {
     if (!viewerRef.current) return null;
     return shapes.map((shape, idx) => {
@@ -1149,7 +1146,8 @@ export default function Viewer() {
               pathologist: data.pathologist || "",
               validationDate: data.validation_date || "",
             });
-            setLabelInput(data.filename || "Extraction");
+            // ✨ CORRECTION ICI : On utilise bien l'annotation_label retourné par le backend s'il existe
+            setLabelInput(data.annotation_label || data.name || data.filename || "Extraction");
           }
         })
         .catch((err) => console.error("Erreur chargement:", err))
@@ -1169,7 +1167,6 @@ export default function Viewer() {
           roi: shapes[0],
         },
       });
-      window.location.reload();
     } else {
       setShowSidebar(false);
     }
@@ -1178,6 +1175,24 @@ export default function Viewer() {
   const handleStayOnImage = () => {
     setShowSuccessModal(false);
     setShowSidebar(false);
+  };
+
+  // NOUVEAUX BOUTONS DE NAVIGATION DU WORKFLOW
+  const handleNextWorkflowStep = () => {
+    if (currentStep < MOCK_FORM_IDS.length - 1) {
+      setCurrentStep((prev) => prev + 1);
+    } else {
+      setIsWorkflowFinished(true);
+    }
+  };
+
+  const handlePrevWorkflowStep = () => {
+    if (isWorkflowFinished) {
+      setIsWorkflowFinished(false);
+      setCurrentStep(MOCK_FORM_IDS.length - 1);
+    } else {
+      setCurrentStep((prev) => Math.max(0, prev - 1));
+    }
   };
 
   const handleSaveAction = async () => {
@@ -1199,19 +1214,11 @@ export default function Viewer() {
       owner: currentUser,
       drawings: shapes,
       prelevement_type: formData.prelevementType || "fine",
-      prelevement_date: formData.prelevementDate
-        ? formData.prelevementDate
-        : null,
+      prelevement_date: formData.prelevementDate ? formData.prelevementDate : null,
       block_number: formData.blockNumber || "",
       fixation: formData.fixation || "formol",
-      slide_count: formData.slideCount
-        ? parseInt(String(formData.slideCount), 10)
-        : null,
-      staining: Array.isArray(formData.staining)
-        ? formData.staining
-        : formData.staining
-          ? [formData.staining]
-          : [],
+      slide_count: formData.slideCount ? parseInt(String(formData.slideCount), 10) : null,
+      staining: Array.isArray(formData.staining) ? formData.staining : formData.staining ? [formData.staining] : [],
       macro_obs: formData.macroObs || "",
       micro_obs: formData.microObs || "",
       histo_type: formData.histoType || "canalaire",
@@ -1418,10 +1425,7 @@ export default function Viewer() {
         >
           <svg className="w-full h-full">
             {renderShapesBackground()}
-
-            {/* 🌟 LA CORRECTION EST ICI : On appelle le rendu des points IA ! */}
             {renderAiPoints()}
-
             {renderTextOverlays()}
 
             {/* Formes en cours de dessin */}
@@ -1461,7 +1465,7 @@ export default function Viewer() {
             <div
               className="absolute bg-slate-800 p-2 rounded-lg shadow-xl border border-slate-600 flex gap-2 pointer-events-auto z-50"
               style={{ left: pendingTextPos.x, top: pendingTextPos.y }}
-              onMouseDown={(e) => e.stopPropagation()} // 🌟 CORRECTION : Bloque le clic pour ne pas annuler le texte !
+              onMouseDown={(e) => e.stopPropagation()}
             >
               <input
                 autoFocus
@@ -1509,7 +1513,7 @@ export default function Viewer() {
                 <div
                   className="absolute bg-slate-800 p-2 rounded-lg shadow-xl border border-blue-500 flex gap-2 pointer-events-auto z-50"
                   style={{ left: pt.x - 50, top: pt.y - 20 }}
-                  onMouseDown={(e) => e.stopPropagation()} // 🌟 CORRECTION ICI AUSSI
+                  onMouseDown={(e) => e.stopPropagation()}
                 >
                   <input
                     autoFocus
@@ -1754,56 +1758,115 @@ export default function Viewer() {
           <div className="p-6 border-b border-slate-800 flex justify-between items-center bg-slate-950">
             <div>
               <h2 className="text-xl font-bold text-white">
-                {" "}
-                Analyse Pathologique{" "}
+                {isAnnotationMode ? "Analyse Pathologique" : "Nouvelle Extraction"}
               </h2>
               <div className="text-xs text-slate-400">Dossier: {folderId}</div>
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
-            {aiSuggestion && (
-              <div className="bg-slate-800 border-2 border-emerald-500/50 shadow-lg shadow-emerald-500/20 rounded-xl p-4 mb-6 animate-in fade-in zoom-in duration-300">
-                <h3 className="text-sm font-bold text-emerald-400 flex items-center gap-2 mb-3 uppercase tracking-wider">
-                  <SmartToyIcon fontSize="small" /> Analyse IA InstanSeg
-                </h3>
-                <div className="text-sm text-emerald-50 font-mono bg-slate-950 p-4 rounded-lg border border-slate-700 whitespace-pre-wrap leading-relaxed">
-                  {aiSuggestion}
-                </div>
+          {/* RENDU SÉPARÉ : Création vs Annotation */}
+          {!isAnnotationMode ? (
+            // 🔴 MODE CRÉATION (Pas de formulaire OLGA ici !)
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+              <div className="mb-6 pb-4 border-b border-slate-800">
+                <label className="block text-xs font-bold text-emerald-400 uppercase tracking-widest mb-2 ml-1">
+                  Nom de l'extraction
+                </label>
+                <input
+                  type="text"
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white font-bold text-emerald-300 focus:outline-none focus:border-emerald-500 transition-colors"
+                />
               </div>
-            )}
-
-            <div className="mb-6 pb-4 border-b border-slate-800">
-              <label className="block text-xs font-bold text-emerald-400 uppercase tracking-widest mb-2 ml-1">
-                {" "}
-                Nom de l'extraction{" "}
-              </label>
-              <input
-                type="text"
-                value={labelInput}
-                onChange={(e) => setLabelInput(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white font-bold text-emerald-300 focus:outline-none focus:border-emerald-500 transition-colors"
-              />
+              <p className="text-slate-400 text-sm text-center mt-10">
+                Dessinez une zone sur l'image puis cliquez sur "Créer l'extraction" pour démarrer l'analyse.
+              </p>
             </div>
-
-            {renderOlgaForm()}
-          </div>
-
-          <div className="p-6 border-t border-slate-800 bg-slate-950 flex gap-3">
-            <button
-              onClick={handleSaveAction}
-              disabled={loading}
-              className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold hover:shadow-lg hover:shadow-emerald-500/20 transition-all flex justify-center items-center gap-2"
-            >
-              {loading ? (
-                "Sauvegarde..."
-              ) : (
-                <>
-                  <CheckCircleIcon />{" "}
-                  {isAnnotationMode ? "Mettre à jour" : "Créer l'extraction"}
-                </>
+          ) : (
+            // 🟢 MODE ANNOTATION (Formulaire OLGA + IA)
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+              {aiSuggestion && (
+                <div className="bg-slate-800 border-2 border-emerald-500/50 shadow-lg shadow-emerald-500/20 rounded-xl p-4 mb-6 animate-in fade-in zoom-in duration-300">
+                  <h3 className="text-sm font-bold text-emerald-400 flex items-center gap-2 mb-3 uppercase tracking-wider">
+                    <SmartToyIcon fontSize="small" /> Analyse IA InstanSeg
+                  </h3>
+                  <div className="text-sm text-emerald-50 font-mono bg-slate-950 p-4 rounded-lg border border-slate-700 whitespace-pre-wrap leading-relaxed">
+                    {aiSuggestion}
+                  </div>
+                </div>
               )}
-            </button>
+
+              <div className="mb-6 pb-4 border-b border-slate-800">
+                <label className="block text-xs font-bold text-emerald-400 uppercase tracking-widest mb-2 ml-1">
+                  Nom de l'extraction
+                </label>
+                <input
+                  type="text"
+                  value={labelInput}
+                  onChange={(e) => setLabelInput(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white font-bold text-emerald-300 focus:outline-none focus:border-emerald-500 transition-colors"
+                />
+              </div>
+
+              {/* ✨ CORRECTION ICI : On affiche soit le form, soit le message de fin */}
+              {!isWorkflowFinished ? (
+                renderOlgaForm()
+              ) : (
+                <div className="bg-slate-800 border-2 border-emerald-500/50 shadow-lg rounded-xl p-6 text-center animate-in fade-in zoom-in duration-300">
+                  <div className="w-12 h-12 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-4 text-emerald-400">
+                    <CheckCircleIcon fontSize="large" />
+                  </div>
+                  <h3 className="text-lg font-bold text-white mb-2">Étapes terminées</h3>
+                  <p className="text-sm text-slate-400">
+                    Toutes les informations ont été saisies. Vous pouvez valider l'analyse.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* FOOTER AVEC BOUTONS (Différent selon le mode) */}
+          <div className="p-6 border-t border-slate-800 bg-slate-950 flex gap-3">
+            {!isAnnotationMode ? (
+              // Bouton unique pour créer l'extraction
+              <button
+                onClick={handleSaveAction}
+                disabled={loading}
+                className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold hover:shadow-lg hover:shadow-emerald-500/20 transition-all flex justify-center items-center gap-2"
+              >
+                {loading ? "Création..." : "Créer l'extraction"}
+              </button>
+            ) : (
+              // Boutons du workflow
+              <>
+                {currentStep > 0 && (
+                  <button
+                    onClick={handlePrevWorkflowStep}
+                    className="py-4 px-6 rounded-xl bg-slate-800 text-white font-bold hover:bg-slate-700 transition-all flex justify-center items-center"
+                  >
+                    Retour
+                  </button>
+                )}
+
+                {!isWorkflowFinished ? (
+                  <button
+                    onClick={handleNextWorkflowStep}
+                    className="flex-1 py-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-bold hover:shadow-lg hover:shadow-blue-500/20 transition-all flex justify-center items-center gap-2"
+                  >
+                    Suivant ({currentStep + 1}/{MOCK_FORM_IDS.length})
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleSaveAction}
+                    disabled={loading}
+                    className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold hover:shadow-lg hover:shadow-emerald-500/20 transition-all flex justify-center items-center gap-2"
+                  >
+                    {loading ? "Sauvegarde..." : "Mettre à jour l'analyse"}
+                  </button>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
