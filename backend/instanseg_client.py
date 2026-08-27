@@ -62,28 +62,6 @@ class InstanSegClient:
         data = response.json()
         return SegmentResult(**data)
     
-    async def segment_mask(
-        self,
-        file_bytes: bytes,
-        model: str = "brightfield_nuclei",
-        target: str = "nuclei",
-        pixel_size: Optional[float] = None,
-        colorize: bool = True,
-    ) -> bytes:
-        """Obtient un masque PNG de la segmentation"""
-        files = {"file": ("image.png", file_bytes, "image/png")}
-        params = {
-            "model": model,
-            "target": target,
-            "colorize": colorize,
-        }
-        if pixel_size is not None:
-            params["pixel_size"] = pixel_size
-        
-        response = await self.client.post("/segment/mask", files=files, params=params)
-        response.raise_for_status()
-        return response.content
-    
     async def segment_points(
         self,
         file_bytes: bytes,

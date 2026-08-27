@@ -20,16 +20,17 @@ import PersonIcon from "@mui/icons-material/Person";
 // --- IMPORTATION DU MOTEUR CORNERSTONE (Natif) ---
 import cornerstone from "cornerstone-core";
 import cornerstoneMath from "cornerstone-math";
-// @ts-ignore
 import cornerstoneTools from "cornerstone-tools";
 import dicomParser from "dicom-parser";
 import cornerstoneWADOImageLoader from "cornerstone-wado-image-loader";
-// @ts-ignore
 import Hammer from "hammerjs";
 import jsPDF from "jspdf";
 
 // Initialisation globale
 let isConfigured = false;
+/** Outil actif au chargement d'une étude. */
+const DEFAULT_TOOL = "Wwwc";
+
 function configureCornerstone() {
   if (isConfigured) return;
   cornerstoneTools.external.cornerstone = cornerstone;
@@ -42,33 +43,6 @@ function configureCornerstone() {
   isConfigured = true;
 }
 
-// 🌟 L'Extracteur d'identité robuste
-function getConnectedUser() {
-  let doctorName = "Inconnu";
-  try {
-    const possibleKeys = ["user", "auth", "session", "profile", "username", "biopsie_user"];
-    for (const key of possibleKeys) {
-      const val = localStorage.getItem(key) || sessionStorage.getItem(key);
-      if (val) {
-        try {
-          const parsed = JSON.parse(val);
-          doctorName = parsed.username || parsed.name || parsed.email || parsed.user?.username || parsed.user?.name || "Inconnu";
-          if (doctorName !== "Inconnu") break;
-        } catch (e) {
-          doctorName = val;
-          break;
-        }
-      }
-    }
-  } catch (e) {
-    console.error("Erreur lecture identité:", e);
-  }
-  
-  if (doctorName !== "Inconnu" && !doctorName.toLowerCase().startsWith("dr")) {
-    return `Dr. ${doctorName}`;
-  }
-  return doctorName === "Inconnu" ? "Dr. Inconnu" : doctorName;
-}
 
 interface RadiologyViewerProps {
   currentUser?: {
@@ -101,7 +75,7 @@ export default function RadiologyViewer({
   const [isSaving, setIsSaving] = useState(false);
   const [savedSource, setSavedSource] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [activeTool, setActiveTool] = useState("Wwwc");
+  const [activeTool, setActiveTool] = useState(DEFAULT_TOOL);
   const [lastModifiedBy, setLastModifiedBy] = useState<string | null>(null);
 
   const viewerRef = useRef<HTMLDivElement>(null);
@@ -149,8 +123,8 @@ export default function RadiologyViewer({
         toolsToLoad.forEach((ToolClass) => {
           try {
             cornerstoneTools.addToolForElement(element, ToolClass);
-          } catch (e) {
-            /* ignore */
+          } catch {
+            // Outil deja enregistre sur cet element : sans consequence.
           }
         });
 
@@ -165,8 +139,8 @@ export default function RadiologyViewer({
             }, 10);
           },
           changeTextCallback: (
-            data: any,
-            eventData: any,
+            data: { text?: string },
+            _eventData: unknown,
             doneChangingTextCallback: (text: string) => void,
           ) => {
             setTimeout(() => {
@@ -182,7 +156,9 @@ export default function RadiologyViewer({
             cornerstoneTools.ArrowAnnotateTool,
             { configuration: arrowConfig },
           );
-        } catch (e) {}
+        } catch {
+          // ArrowAnnotate deja configure : on garde la configuration en place.
+        }
 
         // Affichage de l'image DICOM
         const image = await cornerstone.loadImage(dicomUrl);
@@ -191,7 +167,7 @@ export default function RadiologyViewer({
         cornerstoneTools.setToolActiveForElement(element, "ZoomMouseWheel", {
           mouseButtonMask: 0,
         });
-        cornerstoneTools.setToolActiveForElement(element, activeTool, {
+        cornerstoneTools.setToolActiveForElement(element, DEFAULT_TOOL, {
           mouseButtonMask: 1,
         });
 
@@ -227,9 +203,26 @@ export default function RadiologyViewer({
     return () => {
       try {
         cornerstone.disable(element);
-      } catch (e) {}
+      } catch {
+        // L'element a deja ete demonte par Cornerstone.
+      }
     };
   }, [studyId]);
+
+  // Activation de l'outil courant, isolée de l'initialisation : changer
+  // d'outil ne doit pas relancer le chargement DICOM ni la restauration des
+  // annotations. Déclaré après l'effet d'init, donc exécuté après lui.
+  useEffect(() => {
+    const element = viewerRef.current;
+    if (!element) return;
+    try {
+      cornerstoneTools.setToolActiveForElement(element, activeTool, {
+        mouseButtonMask: 1,
+      });
+    } catch {
+      // L'élément n'est pas encore activé par Cornerstone.
+    }
+  }, [activeTool]);
 
   const handleSaveData = async (source: "annotations" | "texte") => {
     if (!studyId) return;
@@ -348,7 +341,9 @@ export default function RadiologyViewer({
     allTools.forEach((t) => {
       try {
         cornerstoneTools.setToolPassiveForElement(element, t);
-      } catch (e) {}
+      } catch {
+        // Outil absent de cet element : rien a desactiver.
+      }
     });
 
     cornerstoneTools.setToolActiveForElement(element, toolName, {

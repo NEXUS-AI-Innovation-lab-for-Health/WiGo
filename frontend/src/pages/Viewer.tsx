@@ -23,6 +23,12 @@ import ZoomInIcon from "@mui/icons-material/ZoomIn";
 import ZoomOutIcon from "@mui/icons-material/ZoomOut";
 import PersonIcon from "@mui/icons-material/Person";
 
+import OlgaFormPanel from "../features/workflow/components/OlgaFormPanel";
+import WorkflowStepper from "../features/workflow/components/WorkflowStepper";
+import { STEP_COUNT } from "../features/workflow/steps";
+import { useOlgaForm } from "../features/workflow/useOlgaForm";
+import { useWorkflow } from "../features/workflow/useWorkflow";
+
 type ToolType = "move" | "rect" | "circle" | "polygon" | "text";
 
 interface Shape {
@@ -52,21 +58,6 @@ type InstanSegContour = {
   points: { x: number; y: number }[];
 };
 
-interface OlgaFormField {
-  field_key?: string;
-  field_label?: string;
-  field_type?: string;
-  field_options?: {
-    options?: unknown[];
-    source?: string;
-    multiple?: boolean;
-  };
-}
-
-interface OlgaFormSchema {
-  form?: OlgaFormField[];
-}
-
 export default function Viewer() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -93,38 +84,22 @@ export default function Viewer() {
 
   const [showTexts, setShowTexts] = useState(true);
 
-  // --- ÉTAT DU WORKFLOW (MOCKÉ) ---
-  const MOCK_FORM_IDS = [
-    "a44b3f32-1e4c-4686-9705-6ca67a381c88", // Étape 1 - Prélèvement
-    "a42b3f12-1e4c-7636-9705-6ca87a381c93", // Étape 2 - Préparation
-    "a13b3f32-1e4c-0000-2189-6ca67a381c03", // Étape 3 - Microscopie
-    "a81b3f32-1e4c-8888-2222-9ca27a381c03"  // Étape 4 - Diagnostic
-  ];
-  const [currentStep, setCurrentStep] = useState<number>(0);
-  const [isWorkflowFinished, setIsWorkflowFinished] = useState<boolean>(false);
+  // --- ÉTAT DU WORKFLOW ---
+  // L'avancement vient du serveur : rouvrir une extraction reprend là où le
+  // travail s'était arrêté au lieu de repartir de l'étape 1.
+  const workflow = useWorkflow(extractionId ?? null, currentUser);
+  const currentStep = workflow.currentIndex;
+  const isWorkflowFinished = workflow.isComplete;
 
-  // --- ÉTAT DU FORMULAIRE OLGA ---
-  const [olgaFormSchema, setOlgaFormSchema] = useState<OlgaFormSchema | null>(null);
+  // Saisie en cours uniquement. Les valeurs déjà enregistrées viennent du
+  // serveur : aucune valeur clinique n'est plus inventée par défaut.
+  const [formData, setFormData] = useState<Record<string, unknown>>({});
 
-  const [formData, setFormData] = useState<Record<string, unknown>>({
-    prelevementType: "fine",
-    prelevementDate: "",
-    blockNumber: "",
-    fixation: "formol",
-    slideCount: "",
-    staining: [],
-    macroObs: "",
-    microObs: "",
-    histoType: "canalaire",
-    sbrGrade: "1",
-    margins: "",
-    hormonalReceptors: "",
-    diagnosis: "benin",
-    comments: "",
-    status: "en_analyse",
-    pathologist: "",
-    validationDate: "",
-  });
+  /** Valeurs affichées : état serveur, recouvert par la saisie en cours. */
+  const formValues: Record<string, unknown> = {
+    ...workflow.mergedData,
+    ...formData,
+  };
 
   const [labelInput, setLabelInput] = useState("Extraction");
   const [selectedShapeIndex, setSelectedShapeIndex] = useState<number | null>(null);
@@ -145,30 +120,15 @@ export default function Viewer() {
   const viewerRef = useRef<OpenSeadragon.Viewer | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // --- CHARGEMENT DU FORMULAIRE OLGA COURANT ---
-  useEffect(() => {
-    if (!isAnnotationMode) return;
+  // --- FORMULAIRE OLGA DE L'ÉTAPE COURANTE ---
+  // Le hook gère le chargement, l'annulation des requêtes obsolètes et le
+  // repli sur l'instantané JSON Schema si OLGA est indisponible.
+  const olgaForm = useOlgaForm(currentStep, isAnnotationMode);
 
-    const fetchCurrentForm = async () => {
-      if (isWorkflowFinished) {
-        setOlgaFormSchema(null);
-        return;
-      }
-
-      try {
-        const currentFormId = MOCK_FORM_IDS[currentStep];
-        const response = await fetch(
-          `http://localhost:9091/forms/getFromID/${currentFormId}`
-        );
-        const data = await response.json();
-        setOlgaFormSchema(data);
-      } catch (error) {
-        console.error("Erreur connexion API OLGA:", error);
-      }
-    };
-
-    fetchCurrentForm();
-  }, [currentStep, isWorkflowFinished, isAnnotationMode]);
+  /** Écrit une valeur de formulaire sans capturer un `formData` périmé. */
+  const handleFieldChange = (key: string, value: unknown) => {
+    setFormData((previous) => ({ ...previous, [key]: value }));
+  };
 
   useEffect(() => {
     if (!rawUrl) return;
@@ -220,8 +180,15 @@ export default function Viewer() {
               const minZoom = homeZoom;
               const maxZoom = Math.max(2.5, homeZoom * 8);
 
-              (viewer.viewport as any).minZoomLevel = minZoom;
-              (viewer.viewport as any).maxZoomLevel = maxZoom;
+              // `minZoomLevel` / `maxZoomLevel` sont documentées comme options
+              // du constructeur ; OpenSeadragon les lit aussi sur le viewport,
+              // mais ses types ne les déclarent pas.
+              const zoomBounds = viewer.viewport as OpenSeadragon.Viewport & {
+                minZoomLevel: number;
+                maxZoomLevel: number;
+              };
+              zoomBounds.minZoomLevel = minZoom;
+              zoomBounds.maxZoomLevel = maxZoom;
 
               viewer.addHandler("animation", () => {
                 const bounds = roiRect;
@@ -898,7 +865,8 @@ export default function Viewer() {
             }}
           />
         );
-      } catch (e) {
+      } catch {
+        // Contour illisible : on ignore ce blob plutôt que de casser le calque.
         return null;
       }
     });
@@ -1126,27 +1094,8 @@ export default function Viewer() {
             setShapes(data.drawings);
           }
           if (data) {
-            setFormData({
-              ...formData,
-              prelevementType: data.prelevement_type || "fine",
-              prelevementDate: data.prelevement_date || "",
-              blockNumber: data.block_number || "",
-              fixation: data.fixation || "formol",
-              slideCount: data.slide_count ? data.slide_count.toString() : "",
-              staining: data.staining || [],
-              macroObs: data.macro_obs || "",
-              microObs: data.micro_obs || "",
-              histoType: data.histo_type || "canalaire",
-              sbrGrade: data.sbr_grade || "1",
-              margins: data.margins || "",
-              hormonalReceptors: data.hormonal_receptors || "",
-              diagnosis: data.diagnosis || "benin",
-              comments: data.comments || "",
-              status: data.status || "en_analyse",
-              pathologist: data.pathologist || "",
-              validationDate: data.validation_date || "",
-            });
-            // ✨ CORRECTION ICI : On utilise bien l'annotation_label retourné par le backend s'il existe
+            // Les valeurs du formulaire viennent désormais du moteur de
+            // workflow ; on ne garde ici que le libellé de l'extraction.
             setLabelInput(data.annotation_label || data.name || data.filename || "Extraction");
           }
         })
@@ -1177,22 +1126,20 @@ export default function Viewer() {
     setShowSidebar(false);
   };
 
-  // NOUVEAUX BOUTONS DE NAVIGATION DU WORKFLOW
-  const handleNextWorkflowStep = () => {
-    if (currentStep < MOCK_FORM_IDS.length - 1) {
-      setCurrentStep((prev) => prev + 1);
-    } else {
-      setIsWorkflowFinished(true);
-    }
+  // --- NAVIGATION DU WORKFLOW ---
+  // « Suivant » persiste l'étape puis laisse le serveur décider de la
+  // transition : si elle est refusée, l'interface ne bouge pas.
+  const handleNextWorkflowStep = async () => {
+    const fields = olgaForm.schema?.["x-order"] ?? [];
+    const stepData = Object.fromEntries(
+      fields.map((field) => [field, formValues[field] ?? ""]),
+    );
+    const saved = await workflow.saveCurrentStep(stepData, true);
+    if (saved) setFormData({});
   };
 
   const handlePrevWorkflowStep = () => {
-    if (isWorkflowFinished) {
-      setIsWorkflowFinished(false);
-      setCurrentStep(MOCK_FORM_IDS.length - 1);
-    } else {
-      setCurrentStep((prev) => Math.max(0, prev - 1));
-    }
+    void workflow.goBack();
   };
 
   const handleSaveAction = async () => {
@@ -1213,23 +1160,29 @@ export default function Viewer() {
       extraction_id: extractionId,
       owner: currentUser,
       drawings: shapes,
-      prelevement_type: formData.prelevementType || "fine",
-      prelevement_date: formData.prelevementDate ? formData.prelevementDate : null,
-      block_number: formData.blockNumber || "",
-      fixation: formData.fixation || "formol",
-      slide_count: formData.slideCount ? parseInt(String(formData.slideCount), 10) : null,
-      staining: Array.isArray(formData.staining) ? formData.staining : formData.staining ? [formData.staining] : [],
-      macro_obs: formData.macroObs || "",
-      micro_obs: formData.microObs || "",
-      histo_type: formData.histoType || "canalaire",
-      sbr_grade: formData.sbrGrade || "1",
-      margins: formData.margins || "",
-      hormonal_receptors: formData.hormonalReceptors || "",
-      diagnosis: formData.diagnosis || "benin",
-      comments: formData.comments || "",
-      status: formData.status || "en_analyse",
-      pathologist: formData.pathologist || "",
-      validation_date: formData.validationDate ? formData.validationDate : null,
+      prelevement_type: formValues.prelevementType || "",
+      prelevement_date: formValues.prelevementDate || null,
+      block_number: formValues.blockNumber || "",
+      fixation: formValues.fixation || "",
+      slide_count: formValues.slideCount
+        ? parseInt(String(formValues.slideCount), 10)
+        : null,
+      staining: Array.isArray(formValues.staining)
+        ? formValues.staining
+        : formValues.staining
+          ? [formValues.staining]
+          : [],
+      macro_obs: formValues.macroObs || "",
+      micro_obs: formValues.microObs || "",
+      histo_type: formValues.histoType || "",
+      sbr_grade: formValues.sbrGrade || "",
+      margins: formValues.margins || "",
+      hormonal_receptors: formValues.hormonalReceptors || "",
+      diagnosis: formValues.diagnosis || "",
+      comments: formValues.comments || "",
+      status: formValues.status || "en_analyse",
+      pathologist: formValues.pathologist || "",
+      validation_date: formValues.validationDate || null,
     };
 
     try {
@@ -1254,153 +1207,23 @@ export default function Viewer() {
           navigate("/dashboard");
         }
       } else {
-        alert("Erreur serveur lors de la sauvegarde.");
+        // Le backend renvoie `{ detail }` : l'afficher évite un « Erreur
+        // serveur » opaque qui n'indique ni la cause ni la marche à suivre.
+        const detail =
+          typeof data?.detail === "string"
+            ? data.detail
+            : typeof data?.detail?.message === "string"
+              ? data.detail.message
+              : `Le serveur a répondu ${res.status}.`;
+        alert(`Échec de l'enregistrement : ${detail}`);
       }
-    } catch (err) {
-      alert("Erreur réseau");
+    } catch (error) {
+      alert(
+        `Serveur injoignable : ${error instanceof Error ? error.message : "vérifiez que le backend tourne sur le port 8002."}`,
+      );
     } finally {
       setLoading(false);
     }
-  };
-
-  const renderOlgaForm = () => {
-    if (!olgaFormSchema || !olgaFormSchema.form) {
-      return (
-        <div className="text-slate-400 text-sm p-4">
-          {" "}
-          Chargement du formulaire OLGA...{" "}
-        </div>
-      );
-    }
-
-    return olgaFormSchema.form.map((field: any, index: number) => {
-      const key = field.field_key;
-      if (!key) return null;
-
-      const optionsList = Array.isArray(field.field_options?.options)
-        ? field.field_options.options
-        : [];
-      const isMultiple =
-        field.field_type === "select" &&
-        (field.field_options?.source === "Multiple Text Option" ||
-          field.field_options?.multiple === true ||
-          key === "staining");
-
-      const handleChange = (e: any) => {
-        let value = e.target.value;
-        if (e.target.type === "select-multiple") {
-          value = Array.from(
-            e.target.selectedOptions,
-            (option: any) => option.value,
-          );
-        }
-        setFormData({ ...formData, [key]: value });
-      };
-
-      let currentValue = formData[key];
-      if (isMultiple) {
-        if (!Array.isArray(currentValue))
-          currentValue = currentValue ? [currentValue] : [];
-      } else {
-        if (Array.isArray(currentValue))
-          currentValue = currentValue.length > 0 ? currentValue[0] : "";
-        if (currentValue === undefined || currentValue === null)
-          currentValue = "";
-      }
-
-      switch (field.field_type) {
-        case "text":
-        case "number":
-        case "datepicker":
-          return (
-            <div key={index} className="mb-4">
-              <label className="block text-xs text-slate-400 mb-1 ml-1">
-                {field.field_label || key}
-              </label>
-              <input
-                type={
-                  field.field_type === "datepicker" ? "date" : field.field_type
-                }
-                value={
-                  currentValue as
-                    | string
-                    | number
-                    | readonly string[]
-                    | undefined
-                }
-                onChange={handleChange}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-emerald-500 transition-colors"
-              />
-            </div>
-          );
-        case "textarea":
-          return (
-            <div key={index} className="mb-4">
-              <label className="block text-xs text-slate-400 mb-1 ml-1">
-                {field.field_label || key}
-              </label>
-              <textarea
-                rows={3}
-                value={currentValue as string}
-                onChange={handleChange}
-                className="w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors"
-              />
-            </div>
-          );
-        case "select":
-          return (
-            <div key={index} className="mb-4">
-              <label className="block text-xs text-slate-400 mb-1 ml-1">
-                {field.field_label || key}
-              </label>
-              <select
-                multiple={isMultiple}
-                value={
-                  currentValue as
-                    | string
-                    | number
-                    | readonly string[]
-                    | undefined
-                }
-                onChange={handleChange}
-                className={`w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-indigo-500 transition-colors ${isMultiple ? "h-24" : ""}`}
-              >
-                {!isMultiple && <option value="">Sélectionner...</option>}
-                {optionsList.map((opt: any, optIdx: number) => {
-                  let optValue = "";
-                  let optLabel = "";
-                  if (typeof opt === "object" && opt !== null) {
-                    optValue =
-                      opt.value ||
-                      opt.id ||
-                      opt.option_id ||
-                      opt.label ||
-                      opt.name ||
-                      String(opt);
-                    optLabel =
-                      opt.label ||
-                      opt.text ||
-                      opt.name ||
-                      opt.option_label ||
-                      opt.value ||
-                      String(opt);
-                  } else {
-                    optValue = String(opt);
-                    optLabel = String(opt);
-                  }
-                  return (
-                    <option key={optIdx} value={optValue}>
-                      {optLabel}
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
-          );
-        default:
-          return null;
-      }
-    });
   };
 
   return (
@@ -1809,20 +1632,48 @@ export default function Viewer() {
                 />
               </div>
 
-              {/* ✨ CORRECTION ICI : On affiche soit le form, soit le message de fin */}
-              {!isWorkflowFinished ? (
-                renderOlgaForm()
-              ) : (
-                <div className="bg-slate-800 border-2 border-emerald-500/50 shadow-lg rounded-xl p-6 text-center animate-in fade-in zoom-in duration-300">
-                  <div className="w-12 h-12 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-4 text-emerald-400">
-                    <CheckCircleIcon fontSize="large" />
-                  </div>
-                  <h3 className="text-lg font-bold text-white mb-2">Étapes terminées</h3>
-                  <p className="text-sm text-slate-400">
-                    Toutes les informations ont été saisies. Vous pouvez valider l'analyse.
+              {/* Avancement du dossier, tel que le serveur le connaît */}
+              {workflow.state && (
+                <WorkflowStepper
+                  state={workflow.state}
+                  onSelect={workflow.goToStep}
+                  disabled={workflow.status === "saving"}
+                />
+              )}
+
+              {workflow.error && (
+                <div className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 flex items-start gap-2">
+                  <p className="text-xs text-red-200 flex-1">{workflow.error}</p>
+                  <button
+                    type="button"
+                    onClick={workflow.clearError}
+                    className="text-xs text-red-200 hover:text-white"
+                    aria-label="Masquer le message"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Dossier validé : information, et non écran bloquant — le
+                  formulaire de l'étape courante reste modifiable. */}
+              {isWorkflowFinished && (
+                <div className="mb-4 flex items-start gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3">
+                  <CheckCircleIcon className="text-emerald-400" fontSize="small" />
+                  <p className="text-xs text-emerald-200">
+                    Les quatre étapes sont validées. Vous pouvez encore corriger
+                    une étape en la sélectionnant ci-dessus, puis mettre à jour
+                    le dossier.
                   </p>
                 </div>
               )}
+
+              <OlgaFormPanel
+                {...olgaForm}
+                values={formValues}
+                onChange={handleFieldChange}
+                disabled={loading || workflow.status === "saving"}
+              />
             </div>
           )}
 
@@ -1838,29 +1689,36 @@ export default function Viewer() {
                 {loading ? "Création..." : "Créer l'extraction"}
               </button>
             ) : (
-              // Boutons du workflow
+              // Boutons du workflow : l'étape reste enregistrable même une
+              // fois le dossier validé, pour permettre une correction.
               <>
-                {currentStep > 0 && (
+                {workflow.canGoBack && (
                   <button
                     onClick={handlePrevWorkflowStep}
-                    className="py-4 px-6 rounded-xl bg-slate-800 text-white font-bold hover:bg-slate-700 transition-all flex justify-center items-center"
+                    disabled={workflow.status === "saving"}
+                    className="py-4 px-6 rounded-xl bg-slate-800 text-white font-bold hover:bg-slate-700 transition-all flex justify-center items-center disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Retour
                   </button>
                 )}
 
-                {!isWorkflowFinished ? (
-                  <button
-                    onClick={handleNextWorkflowStep}
-                    className="flex-1 py-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-bold hover:shadow-lg hover:shadow-blue-500/20 transition-all flex justify-center items-center gap-2"
-                  >
-                    Suivant ({currentStep + 1}/{MOCK_FORM_IDS.length})
-                  </button>
-                ) : (
+                <button
+                  onClick={handleNextWorkflowStep}
+                  disabled={workflow.status === "saving" || !olgaForm.schema}
+                  className="flex-1 py-4 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-bold hover:shadow-lg hover:shadow-blue-500/20 transition-all flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {workflow.status === "saving"
+                    ? "Enregistrement…"
+                    : currentStep + 1 < STEP_COUNT
+                      ? `Valider et continuer (${currentStep + 1}/${STEP_COUNT})`
+                      : `Valider l'étape ${STEP_COUNT}/${STEP_COUNT}`}
+                </button>
+
+                {isWorkflowFinished && (
                   <button
                     onClick={handleSaveAction}
                     disabled={loading}
-                    className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold hover:shadow-lg hover:shadow-emerald-500/20 transition-all flex justify-center items-center gap-2"
+                    className="flex-1 py-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold hover:shadow-lg hover:shadow-emerald-500/20 transition-all flex justify-center items-center gap-2 disabled:opacity-50"
                   >
                     {loading ? "Sauvegarde..." : "Mettre à jour l'analyse"}
                   </button>

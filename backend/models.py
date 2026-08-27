@@ -1,4 +1,6 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, Float, JSON
+from sqlalchemy import (
+    Column, Integer, String, ForeignKey, DateTime, Text, Float, JSON, UniqueConstraint
+)
 from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime
@@ -78,6 +80,12 @@ class Extraction(Base):
 
     patient = relationship("Patient", back_populates="extractions")
     drawings = relationship("Drawing", back_populates="extraction", cascade="all, delete")
+    workflow = relationship(
+        "WorkflowState",
+        back_populates="extraction",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
 class Drawing(Base):
     __tablename__ = "drawings"
@@ -96,3 +104,73 @@ class Drawing(Base):
     author = Column(String, nullable=True)
     
     extraction = relationship("Extraction", back_populates="drawings")
+
+class WorkflowState(Base):
+    """Avancement du workflow anatomopathologique d'une extraction.
+
+    Table dediee plutot que colonnes supplementaires sur `extractions` :
+    `create_all` sait creer une table absente, alors qu'il n'ajoute jamais
+    de colonne a une table existante. L'ajout se fait donc sans migration.
+    """
+
+    __tablename__ = "workflow_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    extraction_id = Column(
+        Integer,
+        ForeignKey("extractions.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+
+    # Identifiant de l'etape en cours (voir workflow/constants.py).
+    current_step = Column(String, nullable=False)
+    # Renseigne quand la derniere etape a ete validee.
+    completed_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    extraction = relationship("Extraction", back_populates="workflow")
+    steps = relationship(
+        "WorkflowStepState",
+        back_populates="workflow",
+        cascade="all, delete-orphan",
+        order_by="WorkflowStepState.position",
+    )
+
+
+class WorkflowStepState(Base):
+    """Donnees saisies et validation d'une etape.
+
+    `data` accueille l'integralite du formulaire OLGA, y compris les champs
+    qui n'ont pas de colonne dediee sur `extractions` : plus aucune saisie
+    n'est perdue si un formulaire evolue cote OLGA.
+    """
+
+    __tablename__ = "workflow_step_states"
+    __table_args__ = (UniqueConstraint("workflow_state_id", "step", name="uq_workflow_step"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_state_id = Column(
+        Integer,
+        ForeignKey("workflow_states.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+
+    step = Column(String, nullable=False)
+    position = Column(Integer, nullable=False)
+    data = Column(JSON, nullable=False, default=dict)
+
+    validated_at = Column(DateTime, nullable=True)
+    validated_by = Column(String, nullable=True)
+
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    workflow = relationship("WorkflowState", back_populates="steps")

@@ -1,6 +1,8 @@
 import { useEffect, useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getPatients, type Patient } from '../services/api';
+import AddPatientModal from '../components/AddPatientModal';
+import UploadMedicalImage from '../components/UploadMedicalImage';
 
 // Icônes
 import SmartToyIcon from '@mui/icons-material/SmartToy';
@@ -9,6 +11,8 @@ import PersonIcon from '@mui/icons-material/Person';
 import AnalyticsIcon from '@mui/icons-material/Analytics';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import LogoutIcon from '@mui/icons-material/Logout';
+import AddIcon from '@mui/icons-material/Add';
+import CloudUploadIcon from '@mui/icons-material/CloudUpload';
 
 // Composants externes
 import PatientCard from '../components/PatientCard';
@@ -37,6 +41,8 @@ export default function Dashboard() {
   const [patients, setPatients] = useState<Patient[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null); 
+  const [showAddPatient, setShowAddPatient] = useState(false);
+  const [showUpload, setShowUpload] = useState(false);
   
   const username = localStorage.getItem("biopsie_user") || "Invité";
   const initials = username.split(' ').map(n => n[0]).join('').toUpperCase().slice(0, 2);
@@ -108,6 +114,11 @@ export default function Dashboard() {
       navigate('/login');
   };
 
+  const handlePatientCreated = (patient: Patient) => {
+    setPatients((current) => [...current, patient]);
+    setShowAddPatient(false);
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 p-6 md:p-10 relative overflow-hidden font-sans text-white">
       <div className="absolute top-0 left-0 w-full h-96 bg-gradient-to-b from-slate-900 to-transparent -z-10"></div>
@@ -118,6 +129,12 @@ export default function Dashboard() {
             <p className="text-slate-400 mt-2">Bienvenue, {username}</p>
           </div>
           <div className="flex items-center gap-4">
+             <button onClick={() => setShowAddPatient(true)} className="flex items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 font-semibold text-white hover:bg-cyan-500" title="Créer un patient">
+               <AddIcon fontSize="small" /> Nouveau Patient
+             </button>
+             <button onClick={() => setShowUpload(true)} className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 font-semibold text-white hover:border-cyan-500" title="Importer une imagerie">
+               <CloudUploadIcon fontSize="small" /> Importer Imagerie
+             </button>
              <div className="h-12 w-12 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center font-bold shadow-lg shadow-cyan-500/20 ring-2 ring-slate-800">
                 {initials}
              </div>
@@ -195,13 +212,15 @@ export default function Dashboard() {
                 ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                       {patients.map((patient) => (
-                        <PatientCard key={patient.id} patient={patient} />
+                        <PatientCard key={patient.id} patient={patient} onDeleted={fetchPatients} />
                       ))}
                     </div>
                 )}
             </>
         )}
       </div>
+      {showAddPatient && <AddPatientModal onClose={() => setShowAddPatient(false)} onCreated={handlePatientCreated} />}
+      {showUpload && <UploadMedicalImage patients={patients} onClose={() => setShowUpload(false)} onUploaded={fetchPatients} />}
     </div>
   );
 }

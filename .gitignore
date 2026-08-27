@@ -31,3 +31,16 @@ __pycache__/
 backend/vips/
 backend/openslide_bin/
 node_modules/
+# Données médicales et artefacts générés (ne jamais versionner)
+backend/dzi_data/
+*.tif
+*.dcm
+*.DCM
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Fichiers de verrou Office (créés tant qu'un document est ouvert)
+~$*

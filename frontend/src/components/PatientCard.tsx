@@ -8,6 +8,10 @@ import CalendarTodayIcon from '@mui/icons-material/CalendarToday';
 import MedicalServicesIcon from '@mui/icons-material/MedicalServices';
 import AssignmentIcon from '@mui/icons-material/Assignment';
 import DeleteIcon from '@mui/icons-material/Delete';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import axios from 'axios';
+
+import { deletePatient } from '../services/api';
 
 interface Biopsy {
   id: number;
@@ -18,6 +22,7 @@ interface Biopsy {
 
 interface RadiologyStudy {
   id: number;
+  orthanc_study_id: string;
   modality: string;
   description: string;
 }
@@ -41,35 +46,22 @@ interface Extraction {
   owner?: string;
 }
 
-const PatientCard = ({ patient }: { patient: Patient }) => {
-  if (!patient) {
-      return null;
-  }
-
+const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () => void }) => {
   const navigate = useNavigate();
   const [extractions, setExtractions] = useState<Extraction[]>([]);
   const [showModal, setShowModal] = useState(false);
   const [hasExtractions, setHasExtractions] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const doctorName = localStorage.getItem("biopsie_user") || "Dr. Non assigné";
 
-  const getDates = () => {
-    const today = new Date();
-    const dateMax = today.toLocaleDateString('fr-FR');
-    const past = new Date();
-    past.setDate(today.getDate() - (Math.floor(Math.random() * 10) + 2)); 
-    const dateMin = past.toLocaleDateString('fr-FR');
-    return { min: dateMin, max: dateMax };
-  };
-  const { min, max } = getDates();
-  const getMotif = () => {
-      const motifs = [ "Masse palpable (QSE)", "Microcalcifications ACR4", "Suivi Oncologique" ];
-      const safeId = patient.id || 0; 
-      return patient.motif || motifs[safeId % motifs.length];
-  };
-  const motifConsultation = getMotif();
+  // Aucune donnée clinique n'est inventée : on n'affiche que ce que la base
+  // contient réellement, et « Non renseigné » sinon.
+  const motifConsultation = patient.motif || "Non renseigné";
+  const birthDate = patient.birth_date
+    ? new Date(patient.birth_date).toLocaleDateString("fr-FR")
+    : "Non renseignée";
 
-  // eslint-disable-next-line react-hooks/rules-of-hooks
   useEffect(() => {
     if (!patient.folder_id) return;
 
@@ -101,7 +93,7 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
     if (!confirm("Confirmer la suppression définitive ?")) return;
 
     try {
-        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8002';
         const res = await fetch(`${apiUrl}/extractions/${id}?username=${encodeURIComponent(doctorName)}`, {
             method: 'DELETE'
         });
@@ -114,7 +106,7 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
             const err = await res.json();
             alert("Erreur: " + err.detail);
         }
-    } catch (err) { alert("Erreur réseau"); }
+    } catch { alert("Erreur réseau"); }
   };
 
   const openViewer = (extractionData?: Extraction) => {
@@ -137,6 +129,34 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
       ? patient.biopsies[0].image_url 
       : "";
 
+  /** Suppression définitive du dossier patient, après confirmation explicite. */
+  const handleDeletePatient = async () => {
+    const confirmed = window.confirm(
+      `Supprimer définitivement le dossier de ${patient.name} ?\n\n` +
+        "Sa lame, ses extractions, ses annotations et son avancement seront perdus. " +
+        "Les études DICOM resteront dans Orthanc.",
+    );
+    if (!confirmed) return;
+
+    setDeleting(true);
+    try {
+      const report = await deletePatient(patient.id);
+      if (report.warnings?.length) {
+        alert(
+          `${report.message}\n\nAvertissements :\n- ${report.warnings.join("\n- ")}`,
+        );
+      }
+      onDeleted?.();
+    } catch (error) {
+      const detail =
+        axios.isAxiosError(error) && error.response?.data?.detail
+          ? error.response.data.detail
+          : "Verifiez que le backend repond.";
+      alert(`Suppression impossible : ${detail}`);
+      setDeleting(false);
+    }
+  };
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 hover:border-cyan-500/50 transition-all duration-300 shadow-lg flex flex-col gap-4 relative overflow-hidden group">
       
@@ -153,6 +173,17 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
                 <span className="text-xs font-mono bg-slate-800 text-slate-400 px-2 py-1 rounded border border-slate-700">ID: {patient.folder_id}</span>
             </div>
         </div>
+
+        <button
+          type="button"
+          onClick={handleDeletePatient}
+          disabled={deleting}
+          title={`Supprimer le dossier de ${patient.name}`}
+          aria-label={`Supprimer le dossier de ${patient.name}`}
+          className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <DeleteOutlineIcon fontSize="small" />
+        </button>
       </div>
       
       {/* INFO MÉDICALES */}
@@ -166,12 +197,12 @@ const PatientCard = ({ patient }: { patient: Patient }) => {
              <span className="font-semibold text-cyan-400 text-right text-xs truncate max-w-[150px]" title={motifConsultation}>{motifConsultation}</span>
           </div>
           <div className="flex justify-between items-center text-sm border-t border-slate-800 pt-3">
-             <div className="flex items-center gap-2 text-slate-400"><CalendarTodayIcon fontSize="small" /><span>Suivi</span></div>
-             <div className="text-right">
-                <div className="text-slate-200 font-mono text-xs">{min}</div>
-                <div className="text-slate-500 text-[10px] text-center leading-none">au</div>
-                <div className="text-slate-200 font-mono text-xs">{max}</div>
-             </div>
+             <div className="flex items-center gap-2 text-slate-400"><CalendarTodayIcon fontSize="small" /><span>Naissance</span></div>
+             <span className="text-slate-200 font-mono text-xs">{birthDate}</span>
+          </div>
+          <div className="flex justify-between items-center text-sm border-t border-slate-800 pt-3">
+             <div className="flex items-center gap-2 text-slate-400"><AssignmentIcon fontSize="small" /><span>Âge</span></div>
+             <span className="text-slate-200 font-mono text-xs">{patient.age} ans</span>
           </div>
       </div>
 

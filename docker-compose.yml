@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # --- Database ---
   postgres:
@@ -99,6 +97,10 @@ services:
       - "5173:5173"
     environment:
       - VITE_API_URL=http://localhost:8002
+      # Service externe OLGA (formulaires du workflow). Résolu par le
+      # NAVIGATEUR, pas par le conteneur : d'où localhost et non un nom de
+      # service Docker. OLGA vit dans sa propre stack (olga-designer-admin-backend).
+      - VITE_OLGA_API_URL=http://localhost:9091
     networks:
       - app_network
 

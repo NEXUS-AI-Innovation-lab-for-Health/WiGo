@@ -1,16 +1,20 @@
 import time
 import os
 import shutil
+import tempfile
+import uuid
+from pathlib import Path
 import pyvips
 import numpy as np
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from minio import Minio
-from minio.error import S3Error
 import requests
 
 # --- IMPORT DU CLIENT INSTANSEG ---
@@ -19,12 +23,30 @@ from instanseg_client import InstanSegClient
 import models
 import database
 
-# --- INIT BDD ---
+# --- SCHEMA DE BASE DE DONNEES ---
+def apply_migrations() -> None:
+    """Amene la base au dernier schema connu, via Alembic.
+
+    Remplace `create_all`, qui creait les tables absentes mais n'ajoutait
+    jamais de colonne a une table existante : toute evolution du modele
+    cassait silencieusement les bases deja deployees.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    root = Path(__file__).resolve().parent
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    command.upgrade(config, "head")
+
+
 try:
-    models.Base.metadata.create_all(bind=database.engine)
-    print("✅ Base de données connectée.")
+    apply_migrations()
+    print("✅ Schéma de base à jour (Alembic).")
 except Exception as e:
-    print(f"❌ ERREUR FATALE BDD : {e}")
+    # L'application démarre malgré tout pour que /health puisse rapporter
+    # l'incident, mais l'erreur est explicite dans les journaux.
+    print(f"❌ ÉCHEC DES MIGRATIONS : {e}")
 
 app = FastAPI()
 
@@ -39,6 +61,13 @@ app.add_middleware(
 DZI_FOLDER = "/app/dzi_data"
 os.makedirs(DZI_FOLDER, exist_ok=True)
 app.mount("/dzi_data", StaticFiles(directory=DZI_FOLDER), name="dzi_data")
+
+# --- MOTEUR DE WORKFLOW ---
+# Nouveau code isole dans son propre package (routeur / service / schemas),
+# amorce de la structure cible sans toucher aux routes historiques.
+from workflow.router import router as workflow_router  # noqa: E402
+
+app.include_router(workflow_router)
 
 # --- CONFIGURATION MINIO ---
 MINIO_HOST = "minio:9000"
@@ -92,6 +121,190 @@ class PatientSchema(BaseModel):
         from_attributes = True
 
 
+class PatientCreate(BaseModel):
+    name: str
+    age: int
+    birth_date: Optional[str] = None
+    family_history: Optional[str] = None
+    medical_history: Optional[str] = None
+
+
+def safe_folder_name(value: str) -> str:
+    cleaned = "".join(char for char in value if char.isalnum() or char in ("-", "_", " "))
+    return cleaned.strip().replace(" ", "-") or "patient"
+
+
+def ensure_minio_bucket() -> None:
+    if not minio_client.bucket_exists(BUCKET_NAME):
+        minio_client.make_bucket(BUCKET_NAME)
+
+
+@app.post("/patients", response_model=PatientSchema, status_code=201)
+def create_patient(payload: PatientCreate, db: Session = Depends(database.get_db)):
+    folder_id = f"{safe_folder_name(payload.name)}-{uuid.uuid4().hex[:8]}"
+    patient = models.Patient(
+        name=payload.name.strip(),
+        age=payload.age,
+        folder_id=folder_id,
+        birth_date=payload.birth_date,
+        family_history=payload.family_history,
+        medical_history=payload.medical_history,
+    )
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
+    return patient
+
+
+@app.post("/patients/{patient_id}/upload-biopsy", response_model=BiopsySchema, status_code=201)
+async def upload_biopsy(
+    patient_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(database.get_db),
+):
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient introuvable")
+
+    extension = Path(file.filename or "").suffix.lower()
+    if extension not in {".svs", ".tif", ".tiff"}:
+        raise HTTPException(status_code=400, detail="Format accepté : .svs, .tif ou .tiff")
+
+    folder_id = safe_folder_name(patient.folder_id)
+    patient_dir = Path(DZI_FOLDER) / folder_id
+    patient_dir.mkdir(parents=True, exist_ok=True)
+    source_name = Path(file.filename or "biopsy.svs").name
+    source_path: Optional[Path] = None
+    dzi_path = patient_dir / f"{Path(source_name).stem}.dzi"
+
+    try:
+        # Le fichier est copié par blocs : il n'est jamais chargé intégralement en RAM.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension, dir=DZI_FOLDER) as temporary:
+            source_path = Path(temporary.name)
+            while chunk := await file.read(8 * 1024 * 1024):
+                temporary.write(chunk)
+
+        ensure_minio_bucket()
+        minio_object_name = f"{folder_id}/{source_name}"
+        minio_client.fput_object(BUCKET_NAME, minio_object_name, str(source_path))
+
+        # PyVips lit le fichier temporaire de façon séquentielle et écrit les tuiles DZI.
+        pyvips.Image.new_from_file(str(source_path), access="sequential").dzsave(
+            str(patient_dir / Path(source_name).stem), tile_size=256, overlap=1, suffix=".jpg"
+        )
+
+        biopsy = models.Biopsy(
+            patient_id=patient.id,
+            image_url=f"{folder_id}/{dzi_path.name}",
+            status="Non analysé",
+        )
+        db.add(biopsy)
+        db.commit()
+        db.refresh(biopsy)
+        return biopsy
+    except Exception as error:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Échec de l'upload de biopsie : {error}")
+    finally:
+        await file.close()
+        if source_path and source_path.exists():
+            source_path.unlink()
+
+
+@app.post("/patients/{patient_id}/upload-radiology", response_model=RadiologySchema, status_code=201)
+async def upload_radiology(
+    patient_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(database.get_db),
+):
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient introuvable")
+    if Path(file.filename or "").suffix.lower() != ".dcm":
+        raise HTTPException(status_code=400, detail="Format accepté : .dcm")
+
+    try:
+        orthanc_response = requests.post(
+            "http://orthanc:8042/instances",
+            data=file.file,
+            auth=("orthanc", "orthanc"),
+            timeout=300,
+        )
+        if orthanc_response.status_code not in {200, 202}:
+            raise HTTPException(status_code=502, detail="Orthanc a refusé le fichier DICOM")
+
+        instance = orthanc_response.json()
+        instance_id = instance.get("ID")
+        if not instance_id:
+            raise HTTPException(status_code=502, detail="Orthanc n'a pas retourné d'identifiant")
+
+        # `ParentStudy` figure dans la reponse du POST, pas dans le detail de
+        # l'instance (qui n'expose que `ParentSeries`) : le relire par GET
+        # renvoyait toujours None, donc un 502 systematique.
+        study_id = instance.get("ParentStudy")
+        if not study_id:
+            raise HTTPException(status_code=502, detail="Étude Orthanc introuvable")
+
+        # Les tags d'etude (date, description) et la modalite vivent aux
+        # niveaux etude et serie, jamais sur l'instance.
+        study_tags: Dict[str, Any] = {}
+        try:
+            study_tags = requests.get(
+                f"http://orthanc:8042/studies/{study_id}",
+                auth=("orthanc", "orthanc"),
+                timeout=60,
+            ).json().get("MainDicomTags", {})
+        except Exception as error:
+            print(f"Orthanc : tags d'etude illisibles ({error})")
+
+        modality = "Inconnue"
+        series_id = instance.get("ParentSeries")
+        if series_id:
+            try:
+                modality = (
+                    requests.get(
+                        f"http://orthanc:8042/series/{series_id}",
+                        auth=("orthanc", "orthanc"),
+                        timeout=60,
+                    )
+                    .json()
+                    .get("MainDicomTags", {})
+                    .get("Modality", "Inconnue")
+                )
+            except Exception as error:
+                print(f"Orthanc : modalite illisible ({error})")
+
+        existing = (
+            db.query(models.RadiologyStudy)
+            .filter(models.RadiologyStudy.orthanc_study_id == study_id)
+            .first()
+        )
+        if existing:
+            # Une meme etude re-televersee ne doit pas creer un doublon.
+            return existing
+
+        study = models.RadiologyStudy(
+            patient_id=patient.id,
+            orthanc_study_id=study_id,
+            modality=modality,
+            description=study_tags.get("StudyDescription")
+            or (file.filename or "Examen radiologique"),
+            date=study_tags.get("StudyDate", ""),
+        )
+        db.add(study)
+        db.commit()
+        db.refresh(study)
+        return study
+    except HTTPException:
+        db.rollback()
+        raise
+    except requests.RequestException as error:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Orthanc indisponible : {error}")
+    finally:
+        await file.close()
+
+
 class DrawingSchema(BaseModel):
     type: str
     x: float
@@ -105,7 +318,6 @@ class DrawingSchema(BaseModel):
 
 
 class AnalysisPayload(BaseModel):
-    filename: str
     x: int
     y: int
     width: int
@@ -144,124 +356,6 @@ class ReportPayload(BaseModel):
     annotations: Optional[str] = ""
 
 
-# --- CREATION DES 3 PATIENTS ---
-@app.post("/seed")
-def seed_database(db: Session = Depends(database.get_db)):
-    try:
-        models.Base.metadata.drop_all(bind=database.engine)
-        models.Base.metadata.create_all(bind=database.engine)
-
-        # 🌟 1. On interroge Orthanc pour récupérer les vrais ID de CE serveur
-        print("🔍 Récupération des études depuis Orthanc...")
-        orthanc_url = "http://orthanc:8042" # Utilise le nom du conteneur Docker !
-        
-        try:
-            # On demande la liste de toutes les études
-            response = requests.get(f"{orthanc_url}/studies", auth=("orthanc", "orthanc"))
-            if response.status_code == 200:
-                orthanc_studies = response.json()
-            else:
-                orthanc_studies = []
-                print(f"⚠️ Impossible de lire Orthanc (Code: {response.status_code})")
-        except Exception as e:
-            print(f"⚠️ Erreur de connexion à Orthanc: {e}")
-            orthanc_studies = []
-
-        # 🌟 2. On crée nos patients de base (pour la partie Biopsie)
-        patients_data = [
-            {
-                "name": "Jean Dupont",
-                "age": 65,
-                "folder": "CMU-1",
-                "birth": "1958-05-12",
-                "family": "Non",
-                "med": "Hypertension",
-                "dzi_filename": "biopsie_cmu_1.dzi",
-            },
-            {
-                "name": "Marie Curie",
-                "age": 58,
-                "folder": "CASE-InstanSeg-HE",
-                "birth": "1965-11-07",
-                "family": "Oui",
-                "med": "Suivi annuel",
-                "dzi_filename": "biopsie_cmu_2.dzi",
-            },
-            {
-                "name": "Paul Martin",
-                "age": 42,
-                "folder": "CMU-2",
-                "birth": "1982-02-23",
-                "family": "Non",
-                "med": "RAS",
-                "dzi_filename": "biopsie_cmu_3.dzi",
-            },
-        ]
-
-        # On sauvegarde les patients créés pour pouvoir leur lier des radios ensuite
-        created_patients = []
-        
-        for p in patients_data:
-            patient = models.Patient(
-                name=p["name"],
-                age=p["age"],
-                folder_id=p["folder"],
-                birth_date=p["birth"],
-                family_history=p["family"],
-                medical_history=p["med"],
-            )
-            db.add(patient)
-            db.commit()
-            db.refresh(patient)
-            created_patients.append(patient)
-
-            biopsy = models.Biopsy(
-                patient_id=patient.id, image_url=p["dzi_filename"], status="Non analysé"
-            )
-            db.add(biopsy)
-            db.commit()
-
-        # 🌟 3. On associe dynamiquement les radios d'Orthanc aux patients
-        print(f"📸 {len(orthanc_studies)} études trouvées dans Orthanc.")
-        
-        for index, study_id in enumerate(orthanc_studies):
-            # On répartit les radios sur nos 3 patients (s'il y a plus de 3 radios, ça boucle)
-            target_patient = created_patients[index % len(created_patients)]
-            
-            # On va chercher les détails de l'étude dans Orthanc (pour la modalité)
-            study_details_url = f"{orthanc_url}/studies/{study_id}"
-            try:
-                details_res = requests.get(study_details_url, auth=("orthanc", "orthanc"))
-                if details_res.status_code == 200:
-                    details = details_res.json()
-                    # On extrait la modalité si elle existe (CT, MR, CR...)
-                    modality = details.get("PatientMainDicomTags", {}).get("Modality", "Inconnue")
-                    study_desc = details.get("MainDicomTags", {}).get("StudyDescription", "Examen Radiologique")
-                else:
-                    modality = "Inconnue"
-                    study_desc = "Examen Radiologique"
-            except:
-                modality = "Inconnue"
-                study_desc = "Examen Radiologique"
-
-            radio = models.RadiologyStudy(
-                patient_id=target_patient.id,
-                orthanc_study_id=study_id, 
-                modality=modality,
-                description=study_desc,
-                date="2026-06-11",
-            )
-            db.add(radio)
-            print(f"🔗 Lié: Patient {target_patient.name} <-> Radio {study_id}")
-
-        db.commit()
-        return {"message": f"Succès ! BDD Réinitialisée avec {len(orthanc_studies)} études liées."}
-    
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # COMPTE-RENDU RADIOLOGIQUE
 @app.get("/radiology/{study_id}/report")
 def get_radiology_report(study_id: str, db: Session = Depends(database.get_db)):
@@ -292,45 +386,122 @@ def save_radiology_report(
     return {"message": "Compte-rendu et annotations sauvegardés !"}
 
 
+@app.on_event("shutdown")
+async def close_clients() -> None:
+    """Ferme le client HTTP d'InstanSeg a l'arret.
+
+    Il etait cree au chargement du module et jamais ferme : les connexions
+    du pool restaient ouvertes jusqu'a la fin du processus.
+    """
+    await instanseg_client.close()
+
+
 # --- ROUTE HEALTH CHECK ---
 @app.get("/health")
 async def health_check():
-    """Vérifie la santé de tous les services"""
+    """Etat reel des dependances du backend.
+
+    La base est reellement interrogee : jusqu'ici `database: connected` etait
+    affirme sans aucun test, ce qui rendait le diagnostic trompeur.
+    """
+    database_state = {"status": "connected"}
     try:
-        instanseg_health = await instanseg_client.health()
-        return {
-            "status": "ok",
-            "backend": "connected",
-            "instanseg": instanseg_health,
-            "database": "connected",
-        }
-    except Exception as e:
-        return {
-            "status": "degraded",
-            "backend": "connected",
-            "instanseg": {"error": str(e), "status": "disconnected"},
-            "database": "connected",
-        }, 503
+        with database.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as error:
+        database_state = {"status": "disconnected", "error": str(error)}
+
+    instanseg_state = {}
+    try:
+        instanseg_state = await instanseg_client.health()
+    except Exception as error:
+        instanseg_state = {"status": "disconnected", "error": str(error)}
+
+    healthy = (
+        database_state["status"] == "connected"
+        and instanseg_state.get("status") != "disconnected"
+    )
+    payload = {
+        "status": "ok" if healthy else "degraded",
+        "backend": "connected",
+        "instanseg": instanseg_state,
+        "database": database_state,
+    }
+    return payload if healthy else JSONResponse(status_code=503, content=payload)
+
+
+def download_biopsy_source(patient: models.Patient, prefix: str = "wigo") -> Path:
+    """Telecharge la lame source d'un patient depuis MinIO vers un fichier temporaire.
+
+    Le depot MinIO contient deux dispositions historiques :
+
+    * ``{folder_id}/{stem}{ext}`` — ecrite par ``POST /patients/{id}/upload-biopsy`` ;
+    * ``{nom}{ext}`` a la racine — ecrite par ``seed_images.py``, qui ignore
+      les dossiers patients.
+
+    S'y ajoute le fait que ``Biopsy.image_url`` designe le fichier DZI affiche
+    par le viewer, dont le nom ne correspond pas forcement a l'objet MinIO
+    (les lames de demonstration sont tuilees sous ``biopsie_cmu_N``).
+
+    On essaie donc les emplacements du plus precis au plus large, et on leve
+    une 404 explicite listant ce qui a ete cherche.
+
+    :raises HTTPException: 404 si aucune source n'est trouvee.
+    """
+    if not patient.biopsies:
+        raise HTTPException(
+            status_code=404, detail="Aucune biopsie disponible pour ce patient"
+        )
+
+    folder = safe_folder_name(patient.folder_id)
+    stem = Path(patient.biopsies[0].image_url).stem
+    extensions = (".svs", ".tif", ".tiff")
+
+    candidates: List[str] = []
+    # 1. Disposition de l'upload applicatif.
+    candidates += [f"{folder}/{stem}{ext}" for ext in extensions]
+    # 2. Objet a la racine portant le meme nom que le DZI.
+    candidates += [f"{stem}{ext}" for ext in extensions]
+    # 3. Objet a la racine nomme d'apres le dossier patient (lames seedees).
+    candidates += [f"{folder}{ext}" for ext in extensions]
+
+    # 4. Tout objet depose sous le dossier du patient, hors extractions.
+    try:
+        for obj in minio_client.list_objects(BUCKET_NAME, prefix=f"{folder}/", recursive=True):
+            name = obj.object_name
+            if "/extractions/" in name:
+                continue
+            if name.lower().endswith(extensions) and name not in candidates:
+                candidates.append(name)
+    except Exception as error:  # noqa: BLE001 - listing best effort
+        print(f"MinIO : listing impossible pour {folder} ({error})")
+
+    for key in candidates:
+        target = Path(tempfile.gettempdir()) / f"{prefix}-{uuid.uuid4().hex}{Path(key).suffix}"
+        try:
+            minio_client.fget_object(BUCKET_NAME, key, str(target))
+            return target
+        except Exception:
+            if target.exists():
+                target.unlink()
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "Lame source introuvable dans MinIO pour ce patient. "
+            f"Emplacements essayes : {', '.join(candidates[:6])}."
+        ),
+    )
 
 
 # --- ROUTE IA : ANALYSE INSTANSEG ---
 @app.post("/analyze-ai")
-async def analyze_image_with_ai(data: AnalysisPayload):
-    # 🎯 Trouver la BONNE image source selon le patient !
-    if data.patient_folder == "CMU-1":
-        source_name = "CMU-1.svs"
-    elif data.patient_folder == "CASE-InstanSeg-HE":
-        source_name = "HE_example.tif"
-    elif data.patient_folder == "CMU-2": 
-        source_name = "CMU-2.svs"
-    else:
-        source_name = "CMU-1.svs"  # Fallback
+async def analyze_image_with_ai(data: AnalysisPayload, db: Session = Depends(database.get_db)):
+    patient = db.query(models.Patient).filter(models.Patient.folder_id == data.patient_folder).first()
+    if not patient or not patient.biopsies:
+        raise HTTPException(status_code=404, detail="Aucune biopsie disponible pour ce patient")
 
-    source_path = f"/app/images_initiales/biopsie/{source_name}"
-    if not os.path.exists(source_path):
-        raise HTTPException(
-            status_code=404, detail=f"Image source introuvable: {source_name}"
-        )
+    source_path = download_biopsy_source(patient, prefix="wigo-ai")
 
     try:
         image = pyvips.Image.new_from_file(source_path, access="sequential")
@@ -350,6 +521,7 @@ async def analyze_image_with_ai(data: AnalysisPayload):
         region = image.extract_area(safe_x, safe_y, safe_w, safe_h)
 
         png_data = region.write_to_buffer(".png")
+        source_path.unlink(missing_ok=True)
 
         print(f"🧠 Analyse InstanSeg en cours ({safe_w}x{safe_h} pixels)...")
         try:
@@ -432,8 +604,12 @@ async def analyze_image_with_ai(data: AnalysisPayload):
         }
 
     except HTTPException:
+        if source_path:
+            source_path.unlink(missing_ok=True)
         raise
     except Exception as e:
+        if source_path:
+            source_path.unlink(missing_ok=True)
         print(f"❌ Erreur IA : {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -474,30 +650,13 @@ def extract_roi(data: AnalysisPayload, db: Session = Depends(database.get_db)):
     filename_str = f"extraction_{int(time.time())}.svs"
     output_path = os.path.join(patient_dir, filename_str)
 
-    # 🎯 CORRECTION : Trouver la BONNE image source selon le patient !
-    if data.patient_folder == "CMU-1":
-        source_minio_name = "CMU-1.svs"
-    elif data.patient_folder == "CASE-InstanSeg-HE":
-        source_minio_name = "HE_example.tif"
-    elif data.patient_folder == "CMU-2":  # 🌟 Changé !
-        source_minio_name = "CMU-2.svs"
-    else:
-        source_minio_name = "CMU-1.svs"
+    if not patient.biopsies:
+        raise HTTPException(status_code=404, detail="Aucune biopsie disponible pour ce patient")
+    source_path = download_biopsy_source(patient, prefix="wigo-roi")
 
-    source_path = f"/app/images_initiales/biopsie/{source_minio_name}"
-
-    if not os.path.exists(source_path):
-        print(f"📥 L'image source n'est pas en local. Téléchargement depuis MinIO...")
+    if source_path.exists():
         try:
-            minio_client.fget_object(BUCKET_NAME, source_minio_name, source_path)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, detail="Impossible de trouver l'image source sur MinIO"
-            )
-
-    if os.path.exists(source_path):
-        try:
-            image = pyvips.Image.new_from_file(source_path, access="sequential")
+            image = pyvips.Image.new_from_file(str(source_path), access="sequential")
             safe_x = max(0, min(data.x, image.width))
             safe_y = max(0, min(data.y, image.height))
             region = image.extract_area(safe_x, safe_y, data.width, data.height)
@@ -524,6 +683,8 @@ def extract_roi(data: AnalysisPayload, db: Session = Depends(database.get_db)):
 
         except Exception as e:
             print(f"⚠️ Erreur PyVips: {e}")
+        finally:
+            source_path.unlink(missing_ok=True)
 
     sc = data.slide_count if isinstance(data.slide_count, int) else None
 
@@ -719,3 +880,82 @@ def delete_extraction(
     db.delete(ext)
     db.commit()
     return {"message": "Supprimé"}
+
+@app.delete("/patients/{patient_id}")
+def delete_patient(patient_id: int, db: Session = Depends(database.get_db)):
+    """Supprime un patient et tout ce qui lui appartient.
+
+    Sont retires : les objets MinIO ranges sous son dossier, les tuiles DZI
+    de ses biopsies, puis la ligne patient — la cascade ORM emporte biopsies,
+    extractions (avec leurs dessins et leur workflow) et etudes radiologiques.
+
+    Les etudes DICOM ne sont PAS supprimees d'Orthanc : purger un PACS est une
+    operation a part, volontairement laissee hors de ce endpoint. Les objets
+    deposes a la racine du bucket par le seeder sont egalement conserves : ils
+    sont reinjectes a chaque demarrage et peuvent servir a d'autres dossiers.
+
+    Le rapport retourne liste ce qui a ete supprime et ce qui a echoue, plutot
+    que d'echouer silencieusement.
+    """
+    patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient introuvable")
+
+    folder = safe_folder_name(patient.folder_id)
+    report = {
+        "patient": patient.name,
+        "folder_id": patient.folder_id,
+        "minio_objects": 0,
+        "dzi_paths": 0,
+        "orthanc_studies_kept": len(patient.radiology_studies),
+        "warnings": [],
+    }
+
+    # 1. Objets MinIO ranges sous le dossier du patient (lame + extractions).
+    try:
+        keys = [
+            obj.object_name
+            for obj in minio_client.list_objects(BUCKET_NAME, prefix=f"{folder}/", recursive=True)
+        ]
+        for key in keys:
+            try:
+                minio_client.remove_object(BUCKET_NAME, key)
+                report["minio_objects"] += 1
+            except Exception as error:
+                report["warnings"].append(f"MinIO {key} : {error}")
+    except Exception as error:
+        report["warnings"].append(f"MinIO listing : {error}")
+
+    # 2. Tuiles DZI : le dossier du patient, plus le DZI propre a chaque
+    #    biopsie (les lames de demonstration sont tuilees a la racine).
+    targets = [Path(DZI_FOLDER) / folder]
+    for biopsy in patient.biopsies:
+        if not biopsy.image_url:
+            continue
+        stem = Path(biopsy.image_url).stem
+        parent = Path(DZI_FOLDER) / Path(biopsy.image_url).parent
+        targets.append(parent / f"{stem}.dzi")
+        targets.append(parent / f"{stem}_files")
+
+    for target in targets:
+        try:
+            resolved = target.resolve()
+            # Garde-fou : ne jamais sortir du dossier des tuiles.
+            if not str(resolved).startswith(str(Path(DZI_FOLDER).resolve())):
+                report["warnings"].append(f"Chemin hors dzi_data ignore : {target}")
+                continue
+            if resolved.is_dir():
+                shutil.rmtree(resolved)
+                report["dzi_paths"] += 1
+            elif resolved.exists():
+                resolved.unlink()
+                report["dzi_paths"] += 1
+        except Exception as error:
+            report["warnings"].append(f"DZI {target} : {error}")
+
+    # 3. Lignes en base (la cascade emporte biopsies, extractions, workflow).
+    db.delete(patient)
+    db.commit()
+
+    report["message"] = f"Patient « {patient.name} » supprimé."
+    return report
