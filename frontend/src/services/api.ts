@@ -84,3 +84,28 @@ export const deletePatient = async (id: number): Promise<DeletePatientReport> =>
   const response = await axios.delete(`${API_URL}/patients/${id}`);
   return response.data;
 };
+
+export interface DeleteBiopsyReport {
+  message: string;
+  minio_objects: number;
+  dzi_paths: number;
+  extractions_conservees: number;
+  warnings: string[];
+}
+
+/** Supprime la lame d'un dossier : objet source, tuiles, puis la ligne. */
+export const deleteBiopsy = async (id: number): Promise<DeleteBiopsyReport> => {
+  const response = await axios.delete(`${API_URL}/biopsies/${id}`);
+  return response.data;
+};
+
+/**
+ * Détache un examen radiologique du dossier.
+ *
+ * L'étude reste dans Orthanc : elle pourra donc être réimportée, y compris
+ * sur un autre dossier patient.
+ */
+export const deleteRadiologyStudy = async (id: number): Promise<{ message: string }> => {
+  const response = await axios.delete(`${API_URL}/radiology-studies/${id}`);
+  return response.data;
+};

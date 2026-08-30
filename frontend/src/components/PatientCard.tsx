@@ -11,7 +11,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import axios from 'axios';
 
-import { deletePatient } from '../services/api';
+import { deleteBiopsy, deletePatient, deleteRadiologyStudy } from '../services/api';
 
 interface Biopsy {
   id: number;
@@ -52,6 +52,14 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
   const [showModal, setShowModal] = useState(false);
   const [hasExtractions, setHasExtractions] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [erreur, setErreur] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState<{
+    titre: string;
+    message: string;
+    libelle: string;
+    action: () => Promise<void>;
+  } | null>(null);
 
   const doctorName = localStorage.getItem("biopsie_user") || "Dr. Non assigné";
 
@@ -89,9 +97,15 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
     }
   };
 
-  const handleDeleteExtraction = async (id: number) => {
-    if (!confirm("Confirmer la suppression définitive ?")) return;
+  const supprimerExtraction = (id: number) =>
+    demanderConfirmation(
+      "Supprimer ce dossier d'analyse ?",
+      'Son image extraite, ses annotations et son avancement seront perdus.',
+      'Supprimer',
+      () => executerSuppressionExtraction(id),
+    );
 
+  const executerSuppressionExtraction = async (id: number) => {
     try {
         const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8002';
         const res = await fetch(`${apiUrl}/extractions/${id}?username=${encodeURIComponent(doctorName)}`, {
@@ -104,9 +118,9 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
             if (newExtractions.length === 0) setHasExtractions(false); 
         } else {
             const err = await res.json();
-            alert("Erreur: " + err.detail);
+            setErreur(typeof err.detail === 'string' ? err.detail : 'Suppression refusée.');
         }
-    } catch { alert("Erreur réseau"); }
+    } catch { setErreur('Serveur injoignable.'); }
   };
 
   const openViewer = (extractionData?: Extraction) => {
@@ -129,38 +143,116 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
       ? patient.biopsies[0].image_url 
       : "";
 
-  /** Suppression définitive du dossier patient, après confirmation explicite. */
-  const handleDeletePatient = async () => {
-    const confirmed = window.confirm(
-      `Supprimer définitivement le dossier de ${patient.name} ?\n\n` +
-        "Sa lame, ses extractions, ses annotations et son avancement seront perdus. " +
-        "Les études DICOM resteront dans Orthanc.",
-    );
-    if (!confirmed) return;
+  /** Message d'erreur lisible, quelle que soit la forme de la réponse. */
+  const messageErreur = (cause: unknown, repli: string): string =>
+    axios.isAxiosError(cause) && typeof cause.response?.data?.detail === 'string'
+      ? cause.response.data.detail
+      : repli;
 
-    setDeleting(true);
+  /**
+   * Les confirmations passent par une modale de l'application, et non par
+   * `window.confirm`.
+   *
+   * Le dialogue natif est supprimé par le navigateur dès que l'utilisateur
+   * coche « Empêcher cette page de créer des boîtes de dialogue
+   * supplémentaires ». `confirm()` renvoie alors `false` immédiatement : le
+   * clic ne produisait plus rien, sans le moindre message, et aucune requête
+   * n'atteignait le serveur.
+   */
+  const demanderConfirmation = (
+    titre: string,
+    message: string,
+    libelle: string,
+    action: () => Promise<void>,
+  ) => {
+    setErreur(null);
+    setConfirmation({ titre, message, libelle, action });
+  };
+
+  const executerConfirmation = async () => {
+    if (!confirmation || busy) return;
+    setBusy(true);
     try {
-      const report = await deletePatient(patient.id);
-      if (report.warnings?.length) {
-        alert(
-          `${report.message}\n\nAvertissements :\n- ${report.warnings.join("\n- ")}`,
-        );
-      }
-      onDeleted?.();
-    } catch (error) {
-      const detail =
-        axios.isAxiosError(error) && error.response?.data?.detail
-          ? error.response.data.detail
-          : "Verifiez que le backend repond.";
-      alert(`Suppression impossible : ${detail}`);
-      setDeleting(false);
+      // La modale reste affichée pendant toute l'opération : c'est le seul
+      // retour visuel dont dispose l'utilisateur, et certaines suppressions
+      // demandent plusieurs secondes.
+      await confirmation.action();
+      setConfirmation(null);
+    } finally {
+      setBusy(false);
     }
+  };
+
+  const supprimerDossier = () =>
+    demanderConfirmation(
+      'Supprimer ce dossier patient ?',
+      `Le dossier de ${patient.name} sera définitivement supprimé : sa lame, ses ` +
+        'extractions, ses annotations et son avancement. Les études DICOM restent ' +
+        'dans Orthanc.',
+      'Supprimer définitivement',
+      async () => {
+        try {
+          setDeleting(true);
+          const rapport = await deletePatient(patient.id);
+          if (rapport.warnings?.length) {
+            setErreur(`Supprimé, avec réserves : ${rapport.warnings.join(' · ')}`);
+          }
+          onDeleted?.();
+        } catch (cause) {
+          setDeleting(false);
+          setErreur(messageErreur(cause, 'Vérifiez que le backend répond.'));
+        }
+      },
+    );
+
+  const supprimerLame = () => {
+    const biopsy = patient.biopsies?.[0];
+    if (!biopsy) return;
+    demanderConfirmation(
+      'Supprimer la lame ?',
+      "Son image et ses tuiles seront effacées. Les extractions déjà réalisées sont " +
+        'conservées. Vous pourrez ensuite importer une autre lame.',
+      'Supprimer la lame',
+      async () => {
+        try {
+          const rapport = await deleteBiopsy(biopsy.id);
+          if (rapport.warnings?.length) {
+            setErreur(`Supprimée, avec réserves : ${rapport.warnings.join(' · ')}`);
+          }
+          onDeleted?.();
+        } catch (cause) {
+          setErreur(messageErreur(cause, 'Vérifiez que le backend répond.'));
+        }
+      },
+    );
+  };
+
+  const supprimerRadiologie = () => {
+    const study = patient.radiology_studies?.[0];
+    if (!study) return;
+    demanderConfirmation(
+      "Détacher l'examen radiologique ?",
+      "L'étude reste dans Orthanc : elle pourra être réimportée, sur ce dossier ou " +
+        'sur un autre.',
+      'Détacher',
+      async () => {
+        try {
+          await deleteRadiologyStudy(study.id);
+          onDeleted?.();
+        } catch (cause) {
+          setErreur(messageErreur(cause, 'Vérifiez que le backend répond.'));
+        }
+      },
+    );
   };
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 hover:border-cyan-500/50 transition-all duration-300 shadow-lg flex flex-col gap-4 relative overflow-hidden group">
       
-      <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-3xl group-hover:bg-cyan-500/10 transition-all"></div>
+      {/* Halo decoratif. `pointer-events-none` est indispensable : etant
+          positionne en absolu, il est peint AU-DESSUS de l'en-tete et
+          interceptait les clics sur le bouton de suppression. */}
+      <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-3xl group-hover:bg-cyan-500/10 transition-all pointer-events-none"></div>
 
       {/* HEADER */}
       <div className="flex justify-between items-start">
@@ -176,8 +268,9 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
 
         <button
           type="button"
-          onClick={handleDeletePatient}
+          onClick={supprimerDossier}
           disabled={deleting}
+          style={{ position: 'relative', zIndex: 10 }}
           title={`Supprimer le dossier de ${patient.name}`}
           aria-label={`Supprimer le dossier de ${patient.name}`}
           className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -186,6 +279,20 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
         </button>
       </div>
       
+      {erreur && (
+        <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 flex items-start gap-2">
+          <p className="text-xs text-red-200 flex-1">{erreur}</p>
+          <button
+            type="button"
+            onClick={() => setErreur(null)}
+            className="text-xs text-red-200 hover:text-white"
+            aria-label="Masquer le message"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* INFO MÉDICALES */}
       <div className="bg-slate-950/50 rounded-xl p-4 border border-slate-800 space-y-3">
           <div className="flex justify-between items-center text-sm">
@@ -206,22 +313,56 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
           </div>
       </div>
 
-      {/* ACTIONS */}
-      <div className="flex gap-3 mt-auto">
-        <button onClick={() => mainBiopsyUrl && openViewer()} className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-colors border border-slate-700 shadow-lg">
-            <VisibilityIcon fontSize="small"/> Biopsie
-        </button>
+      {/* IMAGERIE RATTACHÉE — chaque élément peut être retiré du dossier */}
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => mainBiopsyUrl && openViewer()}
+            disabled={!mainBiopsyUrl}
+            title={mainBiopsyUrl ? 'Ouvrir la lame' : 'Aucune lame importée'}
+            className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg font-medium text-sm flex items-center justify-center gap-2 transition-colors border border-slate-700 shadow-lg disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <VisibilityIcon fontSize="small" /> Biopsie
+          </button>
+          {patient.biopsies && patient.biopsies.length > 0 && (
+            <button
+              type="button"
+              onClick={supprimerLame}
+              disabled={busy}
+              title="Supprimer la lame de ce dossier"
+              aria-label="Supprimer la lame"
+              className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 border border-slate-800 transition-colors disabled:opacity-40"
+            >
+              <DeleteOutlineIcon fontSize="small" />
+            </button>
+          )}
+        </div>
 
-        {/* 🌟 CORRECTION : Le bouton passe maintenant l'ID Orthanc dans l'URL ! */}
         {patient.radiology_studies && patient.radiology_studies.length > 0 && (
-            <button 
-              onClick={() => navigate(`/radiology?patient=${patient.folder_id}&study=${patient.radiology_studies![0].orthanc_study_id}`)} 
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => navigate(`/radiology?patient=${patient.folder_id}&study=${patient.radiology_studies![0].orthanc_study_id}`)}
               className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-cyan-400 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-colors border border-slate-700 shadow-lg"
             >
-                Radio
+              Radio
             </button>
+            <button
+              type="button"
+              onClick={supprimerRadiologie}
+              disabled={busy}
+              title="Détacher cet examen du dossier"
+              aria-label="Détacher l'examen radiologique"
+              className="p-2 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 border border-slate-800 transition-colors disabled:opacity-40"
+            >
+              <DeleteOutlineIcon fontSize="small" />
+            </button>
+          </div>
         )}
-        
+      </div>
+
+      {/* ACTIONS */}
+      <div className="flex gap-3 mt-auto">
+
         {hasExtractions && (
             <button onClick={handleAnnotateClick} className="flex-1 py-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all shadow-lg shadow-cyan-900/20">
                 <EditIcon fontSize="small"/> Dossiers
@@ -258,7 +399,7 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
 
                     {file.owner === doctorName && (
                         <button 
-                            onClick={(e) => { e.stopPropagation(); handleDeleteExtraction(file.id); }} 
+                            onClick={(e) => { e.stopPropagation(); supprimerExtraction(file.id); }} 
                             className="p-2 hover:bg-red-500/20 text-slate-600 hover:text-red-500 rounded-lg transition-colors ml-2"
                             title="Supprimer mon dossier"
                         >
@@ -272,6 +413,47 @@ const PatientCard = ({ patient, onDeleted }: { patient: Patient; onDeleted?: () 
             <div className="p-4 bg-slate-800 border-t border-slate-700 flex gap-2">
                 <button onClick={() => openViewer()} className="flex-1 py-2 bg-emerald-600/20 hover:bg-emerald-600 text-emerald-400 hover:text-white rounded-lg transition-colors font-medium text-sm">+ Nouveau</button>
                 <button onClick={() => setShowModal(false)} className="flex-1 py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white rounded-lg transition-colors font-medium text-sm">Fermer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation applicative — voir `demanderConfirmation` : le dialogue
+          natif du navigateur peut être désactivé par l'utilisateur, ce qui
+          rendait les suppressions silencieusement inopérantes. */}
+      {confirmation && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl">
+            <h4 className="text-lg font-bold text-white">{confirmation.titre}</h4>
+            <p className="mt-3 text-sm text-slate-300">{confirmation.message}</p>
+            {busy && (
+              <p className="mt-3 flex items-center gap-2 text-xs text-cyan-300">
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+                Opération en cours, veuillez patienter…
+              </p>
+            )}
+            <div className="mt-6 flex gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmation(null)}
+                disabled={busy}
+                className="flex-1 rounded-lg bg-slate-800 py-2 text-sm font-medium text-slate-300 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                onClick={executerConfirmation}
+                disabled={busy}
+                autoFocus
+                className="flex-1 rounded-lg bg-red-600 py-2 text-sm font-bold text-white hover:bg-red-500 disabled:opacity-50"
+              >
+                {busy ? 'Suppression…' : confirmation.libelle}
+              </button>
             </div>
           </div>
         </div>

@@ -6,10 +6,11 @@ import uuid
 from pathlib import Path
 import pyvips
 import numpy as np
-from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
+from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -22,6 +23,7 @@ from instanseg_client import InstanSegClient
 
 import models
 import database
+import storage
 
 # --- SCHEMA DE BASE DE DONNEES ---
 def apply_migrations() -> None:
@@ -166,6 +168,18 @@ async def upload_biopsy(
     if not patient:
         raise HTTPException(status_code=404, detail="Patient introuvable")
 
+    # Un dossier ne porte qu'une lame : tout le reste de l'application
+    # travaille sur `patient.biopsies[0]`. Accepter la seconde donnait
+    # l'illusion d'un import reussi alors qu'elle restait invisible.
+    if patient.biopsies:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Ce dossier contient deja une lame ({patient.biopsies[0].image_url}). "
+                "Supprimez-la avant d'en importer une autre."
+            ),
+        )
+
     extension = Path(file.filename or "").suffix.lower()
     if extension not in {".svs", ".tif", ".tiff"}:
         raise HTTPException(status_code=400, detail="Format accepté : .svs, .tif ou .tiff")
@@ -179,18 +193,37 @@ async def upload_biopsy(
 
     try:
         # Le fichier est copié par blocs : il n'est jamais chargé intégralement en RAM.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=extension, dir=DZI_FOLDER) as temporary:
+        # Le fichier temporaire va dans le dossier temporaire du système, et
+        # NON dans `dzi_data` : ce dernier est monté en statique, la lame brute
+        # y était donc téléchargeable le temps de l'import — et un import
+        # interrompu y laissait plusieurs centaines de mégaoctets.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temporary:
             source_path = Path(temporary.name)
             while chunk := await file.read(8 * 1024 * 1024):
                 temporary.write(chunk)
 
         ensure_minio_bucket()
         minio_object_name = f"{folder_id}/{source_name}"
-        minio_client.fput_object(BUCKET_NAME, minio_object_name, str(source_path))
+        # Hors boucle d'événements : l'envoi d'une lame de plusieurs centaines
+        # de mégaoctets gelait l'API entière.
+        await run_in_threadpool(
+            minio_client.fput_object, BUCKET_NAME, minio_object_name, str(source_path)
+        )
 
-        # PyVips lit le fichier temporaire de façon séquentielle et écrit les tuiles DZI.
-        pyvips.Image.new_from_file(str(source_path), access="sequential").dzsave(
-            str(patient_dir / Path(source_name).stem), tile_size=256, overlap=1, suffix=".jpg"
+        # PyVips lit le fichier temporaire de façon séquentielle et écrit les
+        # tuiles DZI. C'est l'étape la plus longue — plusieurs minutes pour une
+        # lame de quelques centaines de mégaoctets — et elle est purement
+        # synchrone : exécutée sur la boucle d'événements, elle rendait l'API
+        # entière injoignable pendant toute sa durée.
+        await run_in_threadpool(
+            lambda: pyvips.Image.new_from_file(
+                str(source_path), access="sequential"
+            ).dzsave(
+                str(patient_dir / Path(source_name).stem),
+                tile_size=256,
+                overlap=1,
+                suffix=".jpg",
+            )
         )
 
         biopsy = models.Biopsy(
@@ -220,15 +253,27 @@ async def upload_radiology(
     patient = db.query(models.Patient).filter(models.Patient.id == patient_id).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient introuvable")
+    # Meme regle que pour la lame : le dossier porte une etude radiologique.
+    if patient.radiology_studies:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Ce dossier contient deja un examen radiologique. "
+                "Supprimez-le avant d'en importer un autre."
+            ),
+        )
+
     if Path(file.filename or "").suffix.lower() != ".dcm":
         raise HTTPException(status_code=400, detail="Format accepté : .dcm")
 
     try:
-        orthanc_response = requests.post(
+        orthanc_response = await run_in_threadpool(
+            lambda: requests.post(
             "http://orthanc:8042/instances",
-            data=file.file,
-            auth=("orthanc", "orthanc"),
-            timeout=300,
+                data=file.file,
+                auth=("orthanc", "orthanc"),
+                timeout=300,
+            )
         )
         if orthanc_response.status_code not in {200, 202}:
             raise HTTPException(status_code=502, detail="Orthanc a refusé le fichier DICOM")
@@ -249,11 +294,15 @@ async def upload_radiology(
         # niveaux etude et serie, jamais sur l'instance.
         study_tags: Dict[str, Any] = {}
         try:
-            study_tags = requests.get(
-                f"http://orthanc:8042/studies/{study_id}",
-                auth=("orthanc", "orthanc"),
-                timeout=60,
-            ).json().get("MainDicomTags", {})
+            study_tags = (
+                await run_in_threadpool(
+                    lambda: requests.get(
+                        f"http://orthanc:8042/studies/{study_id}",
+                        auth=("orthanc", "orthanc"),
+                        timeout=60,
+                    ).json()
+                )
+            ).get("MainDicomTags", {})
         except Exception as error:
             print(f"Orthanc : tags d'etude illisibles ({error})")
 
@@ -262,12 +311,13 @@ async def upload_radiology(
         if series_id:
             try:
                 modality = (
-                    requests.get(
-                        f"http://orthanc:8042/series/{series_id}",
-                        auth=("orthanc", "orthanc"),
-                        timeout=60,
+                    await run_in_threadpool(
+                        lambda: requests.get(
+                            f"http://orthanc:8042/series/{series_id}",
+                            auth=("orthanc", "orthanc"),
+                            timeout=60,
+                        ).json()
                     )
-                    .json()
                     .get("MainDicomTags", {})
                     .get("Modality", "Inconnue")
                 )
@@ -280,8 +330,24 @@ async def upload_radiology(
             .first()
         )
         if existing:
-            # Une meme etude re-televersee ne doit pas creer un doublon.
-            return existing
+            # Orthanc dedoublonne par UID DICOM : re-televerser le meme fichier
+            # renvoie l'etude deja indexee. Elle appartient donc a un dossier —
+            # possiblement un AUTRE que celui-ci. Retourner cette ligne telle
+            # quelle laissait croire a un import reussi alors que le dossier
+            # courant ne recevait rien.
+            proprietaire = (
+                db.query(models.Patient)
+                .filter(models.Patient.id == existing.patient_id)
+                .first()
+            )
+            nom = proprietaire.name if proprietaire else "un autre dossier"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cet examen DICOM est deja rattache au dossier de {nom}. "
+                    "Un meme examen ne peut pas appartenir a deux patients."
+                ),
+            )
 
         study = models.RadiologyStudy(
             patient_id=patient.id,
@@ -453,28 +519,11 @@ def download_biopsy_source(patient: models.Patient, prefix: str = "wigo") -> Pat
             status_code=404, detail="Aucune biopsie disponible pour ce patient"
         )
 
-    folder = safe_folder_name(patient.folder_id)
-    stem = Path(patient.biopsies[0].image_url).stem
-    extensions = (".svs", ".tif", ".tiff")
-
-    candidates: List[str] = []
-    # 1. Disposition de l'upload applicatif.
-    candidates += [f"{folder}/{stem}{ext}" for ext in extensions]
-    # 2. Objet a la racine portant le meme nom que le DZI.
-    candidates += [f"{stem}{ext}" for ext in extensions]
-    # 3. Objet a la racine nomme d'apres le dossier patient (lames seedees).
-    candidates += [f"{folder}{ext}" for ext in extensions]
-
-    # 4. Tout objet depose sous le dossier du patient, hors extractions.
-    try:
-        for obj in minio_client.list_objects(BUCKET_NAME, prefix=f"{folder}/", recursive=True):
-            name = obj.object_name
-            if "/extractions/" in name:
-                continue
-            if name.lower().endswith(extensions) and name not in candidates:
-                candidates.append(name)
-    except Exception as error:  # noqa: BLE001 - listing best effort
-        print(f"MinIO : listing impossible pour {folder} ({error})")
+    # La liste des emplacements possibles est partagee avec le script
+    # d'injection : voir backend/storage.py.
+    candidates = storage.candidate_object_keys(
+        minio_client, BUCKET_NAME, patient.folder_id, patient.biopsies[0].image_url
+    )
 
     for key in candidates:
         target = Path(tempfile.gettempdir()) / f"{prefix}-{uuid.uuid4().hex}{Path(key).suffix}"
@@ -501,14 +550,28 @@ async def analyze_image_with_ai(data: AnalysisPayload, db: Session = Depends(dat
     if not patient or not patient.biopsies:
         raise HTTPException(status_code=404, detail="Aucune biopsie disponible pour ce patient")
 
-    source_path = download_biopsy_source(patient, prefix="wigo-ai")
+    # Telechargement de la lame source (potentiellement plusieurs centaines
+    # de Mo) : hors boucle d'evenements.
+    source_path = await run_in_threadpool(
+        download_biopsy_source, patient, "wigo-ai"
+    )
+
+    def _borner_region():
+        """Ouvre la lame et borne la région demandée à ses dimensions réelles."""
+        image = pyvips.Image.new_from_file(str(source_path), access="sequential")
+        x = max(0, min(data.x, image.width))
+        y = max(0, min(data.y, image.height))
+        return x, y, min(data.width, image.width - x), min(data.height, image.height - y)
+
+    def _extraire_png(x, y, largeur, hauteur):
+        """Découpe la région et l'encode en PNG."""
+        image = pyvips.Image.new_from_file(str(source_path), access="sequential")
+        return image.extract_area(x, y, largeur, hauteur).write_to_buffer(".png")
 
     try:
-        image = pyvips.Image.new_from_file(source_path, access="sequential")
-        safe_x = max(0, min(data.x, image.width))
-        safe_y = max(0, min(data.y, image.height))
-        safe_w = min(data.width, image.width - safe_x)
-        safe_h = min(data.height, image.height - safe_y)
+        # Toutes les opérations PyVips sont synchrones : les laisser sur la
+        # boucle d'événements bloquait l'API pendant leur exécution.
+        safe_x, safe_y, safe_w, safe_h = await run_in_threadpool(_borner_region)
 
         if safe_w > 1500 or safe_h > 1500:
             return {
@@ -518,9 +581,9 @@ async def analyze_image_with_ai(data: AnalysisPayload, db: Session = Depends(dat
             }
 
         print(f"📐 Extraction région {safe_w}x{safe_h}px...")
-        region = image.extract_area(safe_x, safe_y, safe_w, safe_h)
-
-        png_data = region.write_to_buffer(".png")
+        png_data = await run_in_threadpool(
+            _extraire_png, safe_x, safe_y, safe_w, safe_h
+        )
         source_path.unlink(missing_ok=True)
 
         print(f"🧠 Analyse InstanSeg en cours ({safe_w}x{safe_h} pixels)...")
@@ -627,20 +690,18 @@ def extract_roi(data: AnalysisPayload, db: Session = Depends(database.get_db)):
         .first()
     )
     if not patient:
-        patient = models.Patient(
-            name=data.patient_name, age=0, folder_id=data.patient_folder
+        # Vestige d'avant l'existence de POST /patients : cette route creait
+        # un dossier patient (age 0) a partir du corps de la requete. Sur un
+        # dossier medical, creer une identite depuis une entree non
+        # authentifiee est inacceptable — et cela produisait des dossiers
+        # fantomes des qu'un identifiant erronne etait transmis.
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Dossier patient introuvable. Creez-le d'abord "
+                "(POST /patients) avant d'extraire une region."
+            ),
         )
-        db.add(patient)
-        db.commit()
-        db.refresh(patient)
-
-    if data.birth_date:
-        patient.birth_date = data.birth_date
-    if data.family_history:
-        patient.family_history = data.family_history
-    if data.medical_history:
-        patient.medical_history = data.medical_history
-    db.commit()
 
     safe_folder = "".join(
         c for c in data.patient_folder if c.isalnum() or c in (" ", "-", "_")
@@ -882,7 +943,11 @@ def delete_extraction(
     return {"message": "Supprimé"}
 
 @app.delete("/patients/{patient_id}")
-def delete_patient(patient_id: int, db: Session = Depends(database.get_db)):
+def delete_patient(
+    patient_id: int,
+    taches: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+):
     """Supprime un patient et tout ce qui lui appartient.
 
     Sont retires : les objets MinIO ranges sous son dossier, les tuiles DZI
@@ -937,21 +1002,12 @@ def delete_patient(patient_id: int, db: Session = Depends(database.get_db)):
         targets.append(parent / f"{stem}.dzi")
         targets.append(parent / f"{stem}_files")
 
+    differes: List[Path] = []
     for target in targets:
-        try:
-            resolved = target.resolve()
-            # Garde-fou : ne jamais sortir du dossier des tuiles.
-            if not str(resolved).startswith(str(Path(DZI_FOLDER).resolve())):
-                report["warnings"].append(f"Chemin hors dzi_data ignore : {target}")
-                continue
-            if resolved.is_dir():
-                shutil.rmtree(resolved)
-                report["dzi_paths"] += 1
-            elif resolved.exists():
-                resolved.unlink()
-                report["dzi_paths"] += 1
-        except Exception as error:
-            report["warnings"].append(f"DZI {target} : {error}")
+        _retirer_chemin(target, report, differes)
+
+    if differes:
+        taches.add_task(_effacer_en_arriere_plan, differes)
 
     # 3. Lignes en base (la cascade emporte biopsies, extractions, workflow).
     db.delete(patient)
@@ -959,3 +1015,136 @@ def delete_patient(patient_id: int, db: Session = Depends(database.get_db)):
 
     report["message"] = f"Patient « {patient.name} » supprimé."
     return report
+
+
+def _effacer_en_arriere_plan(chemins: List[Path]) -> None:
+    """Efface reellement les dossiers deja mis de cote.
+
+    Retire ensuite le dossier parent s'il est devenu vide, pour ne pas laisser
+    une arborescence de dossiers patients sans contenu.
+    """
+    racine = Path(DZI_FOLDER).resolve()
+    for chemin in chemins:
+        try:
+            shutil.rmtree(chemin, ignore_errors=True)
+            parent = chemin.parent
+            if parent != racine and str(parent).startswith(str(racine)):
+                try:
+                    parent.rmdir()  # echoue si le dossier n'est pas vide
+                except OSError:
+                    pass
+        except Exception as error:  # noqa: BLE001 - nettoyage best effort
+            print(f"Nettoyage differe impossible pour {chemin} : {error}")
+
+
+def _retirer_chemin(cible: Path, rapport: dict, differes: List[Path]) -> None:
+    """Retire un chemin de tuiles, immediatement pour l'utilisateur.
+
+    Un dossier de tuiles contient des dizaines de milliers de fichiers : le
+    supprimer prend pres d'une minute sur un volume monte. On le **renomme**
+    d'abord — operation instantanee, qui le fait disparaitre pour de bon du
+    point de vue de l'application — puis on planifie son effacement reel en
+    tache de fond. La reponse HTTP n'attend donc plus le systeme de fichiers.
+    """
+    racine = Path(DZI_FOLDER).resolve()
+    try:
+        resolu = cible.resolve()
+        # Garde-fou : ne jamais sortir du dossier des tuiles.
+        if not str(resolu).startswith(str(racine)):
+            rapport["warnings"].append(f"Chemin hors dzi_data ignore : {cible}")
+            return
+
+        if resolu.is_dir():
+            ecarte = resolu.with_name(f"{resolu.name}.suppression-{uuid.uuid4().hex[:8]}")
+            resolu.rename(ecarte)
+            differes.append(ecarte)
+            rapport["dzi_paths"] += 1
+        elif resolu.exists():
+            resolu.unlink()
+            rapport["dzi_paths"] += 1
+    except Exception as error:
+        rapport["warnings"].append(f"DZI {cible} : {error}")
+
+
+def _supprimer_tuiles(image_url: str, rapport: dict, differes: List[Path]) -> None:
+    """Retire le fichier .dzi et le dossier de tuiles d'une lame."""
+    if not image_url:
+        return
+
+    stem = Path(image_url).stem
+    parent = Path(DZI_FOLDER) / Path(image_url).parent
+    for cible in (parent / f"{stem}.dzi", parent / f"{stem}_files"):
+        _retirer_chemin(cible, rapport, differes)
+
+
+@app.delete("/biopsies/{biopsy_id}")
+def delete_biopsy(
+    biopsy_id: int,
+    taches: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+):
+    """Supprime une lame : objet MinIO, tuiles DZI, puis la ligne.
+
+    Les extractions deja realisees sur cette lame sont conservees : elles
+    portent leur propre fichier et leur propre compte rendu. Le rapport
+    indique combien restent rattachees au dossier.
+    """
+    biopsy = db.query(models.Biopsy).filter(models.Biopsy.id == biopsy_id).first()
+    if not biopsy:
+        raise HTTPException(status_code=404, detail="Lame introuvable")
+
+    patient = (
+        db.query(models.Patient).filter(models.Patient.id == biopsy.patient_id).first()
+    )
+    rapport = {"minio_objects": 0, "dzi_paths": 0, "extractions_conservees": 0, "warnings": []}
+
+    if patient:
+        rapport["extractions_conservees"] = len(patient.extractions)
+        cle = storage.find_object_key(
+            minio_client, BUCKET_NAME, patient.folder_id, biopsy.image_url
+        )
+        if cle:
+            try:
+                minio_client.remove_object(BUCKET_NAME, cle)
+                rapport["minio_objects"] += 1
+            except Exception as error:
+                rapport["warnings"].append(f"MinIO {cle} : {error}")
+
+    differes: List[Path] = []
+    _supprimer_tuiles(biopsy.image_url, rapport, differes)
+
+    db.delete(biopsy)
+    db.commit()
+
+    if differes:
+        taches.add_task(_effacer_en_arriere_plan, differes)
+
+    rapport["message"] = "Lame supprimee."
+    return rapport
+
+
+@app.delete("/radiology-studies/{study_id}")
+def delete_radiology_study(study_id: int, db: Session = Depends(database.get_db)):
+    """Detache un examen radiologique du dossier patient.
+
+    L'etude reste dans Orthanc : purger un PACS est une operation distincte,
+    volontairement laissee hors de ce endpoint. Le meme fichier pourra donc
+    etre reimporte ensuite, y compris sur un autre dossier.
+    """
+    study = (
+        db.query(models.RadiologyStudy)
+        .filter(models.RadiologyStudy.id == study_id)
+        .first()
+    )
+    if not study:
+        raise HTTPException(status_code=404, detail="Examen radiologique introuvable")
+
+    orthanc_id = study.orthanc_study_id
+    db.delete(study)
+    db.commit()
+
+    return {
+        "message": "Examen radiologique detache du dossier.",
+        "orthanc_study_id": orthanc_id,
+        "orthanc_conserve": True,
+    }

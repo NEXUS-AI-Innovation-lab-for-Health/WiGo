@@ -17,7 +17,9 @@ radiologie.
 """
 
 import os
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import pyvips
@@ -26,6 +28,7 @@ from minio import Minio
 
 import database
 import models
+import storage
 
 ORTHANC_BASE = os.getenv("ORTHANC_URL", "http://orthanc:8042")
 ORTHANC_AUTH = (os.getenv("ORTHANC_USER", "orthanc"), os.getenv("ORTHANC_PASSWORD", "orthanc"))
@@ -106,9 +109,7 @@ def seed_slide(db, minio_client: Minio, path: Path) -> None:
     dzi_path = DZI_FOLDER / dzi_relative
     if not dzi_path.exists():
         print(f"[>] generation des tuiles : {dzi_relative} (peut etre long)")
-        dzi_path.parent.mkdir(parents=True, exist_ok=True)
-        image = pyvips.Image.new_from_file(str(path), access="sequential")
-        image.dzsave(str(dzi_path.with_suffix("")), tile_size=256, overlap=1, suffix=".jpg")
+        generer_tuiles(path, dzi_path)
 
     if existing:
         print(f"[=] biopsie deja referencee pour {folder_id}")
@@ -185,6 +186,72 @@ def seed_dicom(db, path: Path) -> None:
     print(f"[+] etude radiologique enregistree : {study_id} ({dicom_patient_name})")
 
 
+def generer_tuiles(source: Path, destination: Path) -> None:
+    """Produit la pyramide DZI d'une lame.
+
+    `dzsave` attend le chemin SANS extension : il ajoute lui-meme le `.dzi`
+    et cree le dossier `_files` des tuiles.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image = pyvips.Image.new_from_file(str(source), access="sequential")
+    image.dzsave(str(destination.with_suffix("")), tile_size=256, overlap=1, suffix=".jpg")
+
+
+def reconcilier_tuiles(db, minio_client: Minio) -> int:
+    """Regenere les tuiles manquantes des biopsies deja enregistrees.
+
+    Cette passe s'execute a CHAQUE demarrage, meme sur une base peuplee.
+    Sans elle, un depot fraichement clone (ou `dzi_data/` est ignore par git)
+    suivi d'une restauration du dump laisserait des biopsies en base sans
+    aucune tuile : le viewer afficherait un ecran vide, et l'utilisateur
+    devrait lancer une conversion a la main.
+
+    La lame source est rapatriee depuis MinIO uniquement si les tuiles
+    manquent reellement : le cas courant ne coute qu'un acces disque.
+    """
+    regenerees = 0
+
+    for biopsie in db.query(models.Biopsy).all():
+        if not biopsie.image_url:
+            continue
+
+        dzi = DZI_FOLDER / biopsie.image_url
+        if dzi.exists():
+            continue
+
+        patient = (
+            db.query(models.Patient)
+            .filter(models.Patient.id == biopsie.patient_id)
+            .first()
+        )
+        if patient is None:
+            print(f"[!] biopsie {biopsie.id} sans patient : ignoree")
+            continue
+
+        cle = storage.find_object_key(
+            minio_client, BUCKET_NAME, patient.folder_id, biopsie.image_url
+        )
+        if not cle:
+            print(f"[!] tuiles absentes pour {biopsie.image_url} et lame source "
+                  f"introuvable dans MinIO : regeneration impossible")
+            continue
+
+        temporaire = Path(tempfile.gettempdir()) / f"wigo-seed-{uuid.uuid4().hex}{Path(cle).suffix}"
+        try:
+            print(f"[>] tuiles manquantes pour {biopsie.image_url} — regeneration depuis {cle}")
+            minio_client.fget_object(BUCKET_NAME, cle, str(temporaire))
+            generer_tuiles(temporaire, dzi)
+            regenerees += 1
+            print(f"[+] tuiles regenerees : {biopsie.image_url}")
+        except Exception as erreur:
+            print(f"[echec] regeneration de {biopsie.image_url} : {erreur}")
+        finally:
+            if temporaire.exists():
+                temporaire.unlink()
+
+    return regenerees
+
+
 def main() -> None:
     minio_client = Minio(MINIO_URL, access_key=MINIO_KEY, secret_key=MINIO_SECRET, secure=False)
 
@@ -213,9 +280,15 @@ def main() -> None:
         # Un seeder peuple une base VIDE. Sur une base deja remplie, tout
         # reinjecter creerait des doublons et retuilerait des centaines de Mo
         # a chaque `docker compose up`.
+        # Passe systematique : les tuiles sont un artefact regenerable, elles
+        # ne sont pas versionnees. On les reconstruit avant toute autre chose.
+        print("\n--- VERIFICATION DES TUILES ---")
+        regenerees = reconcilier_tuiles(db, minio_client)
+        print(f"[=] {regenerees} pyramide(s) DZI regeneree(s)")
+
         existing = db.query(models.Patient).count()
         if existing:
-            print(f"Base deja peuplee ({existing} patient(s)) : injection ignoree.")
+            print(f"\nBase deja peuplee ({existing} patient(s)) : injection ignoree.")
             return
 
         if BIOPSIE_DIR.is_dir():

@@ -48,8 +48,21 @@ navigateur. À l'import, WiGo range le fichier source dans **MinIO** puis
 génère une **pyramide de tuiles DZI** avec PyVips, servie à la demande selon
 le niveau de zoom par **OpenSeadragon**.
 
-> La conversion est **automatique**, aussi bien à l'import depuis l'interface
-> qu'au premier démarrage de la pile. Aucune commande à lancer.
+> **La conversion est entièrement automatique — aucune commande à lancer.**
+> Elle a lieu à l'import depuis l'interface, et au démarrage des conteneurs :
+> le service `image_seeder` vérifie à chaque lancement que chaque lame
+> enregistrée possède bien ses tuiles, et régénère celles qui manquent depuis
+> la lame source conservée dans MinIO.
+
+**Un dossier ne porte qu'une lame et qu'un examen radiologique.** Tout le
+reste de l'application travaille sur la première de chaque type ; accepter la
+seconde donnait l'illusion d'un import réussi alors qu'elle restait invisible.
+Un second import est donc refusé, avec un message qui explique quoi supprimer.
+Chaque élément se retire indépendamment depuis la carte patient.
+
+> Un examen DICOM ne peut appartenir qu'à un seul dossier. Orthanc dédoublonne
+> par UID : réimporter le même fichier sur un autre patient est refusé, en
+> nommant le dossier qui le détient déjà. Détachez-le d'abord.
 
 Annotation collaborative sur un calque SVG : rectangles, cercles, polygones et
 libellés. Chaque tracé porte son auteur — vert pour les vôtres, orange pour
@@ -133,10 +146,24 @@ cd Projet6
 docker compose up -d --build
 ```
 
-Au premier démarrage, le service `image_seeder` détecte que la base est vide,
-injecte les images présentes dans `backend/images_initiales/`, **génère les
-tuiles DZI**, et crée les dossiers patients correspondants. Rejoué sur une
-base déjà peuplée, il ne fait rien.
+Le service `image_seeder` fait deux choses, dans cet ordre :
+
+1. **À chaque démarrage** — il vérifie que chaque lame enregistrée en base
+   possède ses tuiles DZI, et **régénère celles qui manquent** depuis la lame
+   source conservée dans MinIO. Les tuiles ne sont pas versionnées : sans cette
+   passe, un dépôt fraîchement cloné puis restauré depuis un dump afficherait
+   des visionneuses vides.
+2. **Uniquement si la base est vide** — il injecte les images présentes dans
+   `backend/images_initiales/`, génère leurs tuiles et crée les dossiers
+   patients. Sur une base déjà peuplée, il s'abstient, pour éviter les doublons
+   et le retuilage inutile.
+
+Extrait du journal, lorsque des tuiles manquaient :
+
+    --- VERIFICATION DES TUILES ---
+    [>] tuiles manquantes pour William-30b14509/CMU-1.dzi
+    [+] tuiles regenerees : William-30b14509/CMU-1.dzi
+    [=] 1 pyramide(s) DZI regeneree(s)
 
 ### Accès
 
@@ -288,6 +315,8 @@ Documentation interactive : **http://localhost:8002/docs**
 | `DELETE` | `/patients/{id}` | Suppression du dossier et de ses fichiers |
 | `POST` | `/patients/{id}/upload-biopsy` | Import d'une lame + tuilage DZI |
 | `POST` | `/patients/{id}/upload-radiology` | Import DICOM vers Orthanc |
+| `DELETE` | `/biopsies/{id}` | Retire la lame : objet source, tuiles, ligne |
+| `DELETE` | `/radiology-studies/{id}` | Détache l'examen du dossier (Orthanc conservé) |
 
 ### Analyse et annotations
 
@@ -325,8 +354,9 @@ backend/
 ├── main.py                 API historique (patients, images, IA, extractions)
 ├── models.py               Modèles SQLAlchemy
 ├── database.py             Connexion, session
+├── storage.py              Résolution des lames dans MinIO (partagé)
 ├── instanseg_client.py     Client HTTP du service d'IA
-├── seed_images.py          Injection initiale (base vide uniquement)
+├── seed_images.py          Régénération des tuiles + injection initiale
 ├── workflow/               Moteur d'étapes — structure cible
 │   ├── router.py           Routes HTTP
 │   ├── service.py          Machine à états, règles de transition
@@ -347,7 +377,7 @@ frontend/src/
 │   ├── olga/               Frontière OLGA : client, adaptateur, types
 │   ├── schemas/            Instantanés JSON Schema versionnés
 │   └── components/         Frise d'avancement, rendu de formulaire
-└── scripts/                Régénération des instantanés
+└── (frontend/scripts/)     Régénération des instantanés — hors de src/
 
 instanseg/                  Micro-service de segmentation
 docker-compose.yml          Orchestration des sept conteneurs
@@ -395,13 +425,49 @@ Le message liste les emplacements essayés. Vérifiez que l'objet existe :
 console MinIO, bucket `biopsie`.
 
 **Le seeder n'injecte rien**
-Il ne s'exécute que sur une base vide — c'est voulu, pour éviter les doublons
-et le retuilage à chaque démarrage. Ses journaux : `docker logs p6_image_seeder`.
+L'injection ne s'exécute que sur une base vide — c'est voulu, pour éviter les
+doublons. La vérification des tuiles, elle, tourne à chaque démarrage.
+Journaux : `docker logs p6_image_seeder`.
+
+**« Ce dossier contient déjà une lame » / « déjà un examen radiologique »**
+Un dossier ne porte qu'un élément de chaque type. Retirez l'existant avec le
+bouton corbeille placé à côté de « Biopsie » ou « Radio » sur la carte patient,
+puis relancez l'import.
+
+**« Cet examen DICOM est déjà rattaché au dossier de X »**
+Le même fichier ne peut pas appartenir à deux patients. Détachez-le du dossier
+qui le détient, puis importez-le sur le nouveau. Les trois examens de
+démonstration sont déjà rattachés aux dossiers créés au premier démarrage.
+
+**La plateforme devient injoignable pendant un import (`ERR_CONNECTION_RESET`)**
+Corrigé : le travail lourd d'un import (envoi vers le stockage objet, tuilage)
+s'exécute désormais hors de la boucle d'événements. L'API reste disponible
+pendant toute la durée de l'opération, y compris pour une lame de plusieurs
+centaines de mégaoctets.
+
+**Une suppression paraît sans effet, ou semble demander deux clics**
+Deux causes ont été corrigées : les confirmations passent désormais par une
+modale de l'application, et la suppression d'une lame **répond immédiatement**
+(les tuiles, plusieurs dizaines de milliers de fichiers, sont écartées puis
+effacées en tâche de fond — auparavant la réponse attendait près d'une minute,
+sans aucun retour visuel). Si le comportement persiste, rechargez la page sans
+cache (Ctrl+Maj+R).
+
+**Un bouton de suppression semble sans effet**
+Les confirmations passent par une modale de l'application, pas par le dialogue
+du navigateur : celui-ci est désactivé dès que l'utilisateur coche « Empêcher
+cette page de créer des boîtes de dialogue supplémentaires », ce qui rendait
+les suppressions silencieusement inopérantes. Si le comportement persiste,
+rechargez la page sans cache (Ctrl+Maj+R) pour charger le code à jour.
+
+**Une visionneuse de biopsie reste vide**
+Les tuiles manquent. Relancez la vérification :
+`docker compose up -d --force-recreate image_seeder`, puis suivez
+`docker logs -f p6_image_seeder`. Si la régénération échoue, c'est que la lame
+source est absente de MinIO — le message le précise.
 
 **Le backend démarre mais `/health` renvoie 503**
 La réponse contient l'erreur exacte du service en cause.
-
----
 
 ## Licence
 

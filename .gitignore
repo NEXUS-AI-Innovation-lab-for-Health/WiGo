@@ -44,3 +44,6 @@ backend/dzi_data/
 
 # Fichiers de verrou Office (créés tant qu'un document est ouvert)
 ~$*
+
+
+livrables/

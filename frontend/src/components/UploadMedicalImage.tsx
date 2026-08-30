@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { ChangeEvent, DragEvent } from 'react';
 import CloseIcon from '@mui/icons-material/Close';
 import CloudUploadIcon from '@mui/icons-material/CloudUpload';
+import axios from 'axios';
 import { uploadMedicalImage, type Patient } from '../services/api';
 
 interface UploadMedicalImageProps {
@@ -48,8 +49,15 @@ export default function UploadMedicalImage({ patients, onClose, onUploaded }: Up
       await uploadMedicalImage(Number(patientId), type, file, setProgress);
       onUploaded();
       onClose();
-    } catch {
-      setError("L'envoi a échoué. Vérifiez le service concerné.");
+    } catch (cause) {
+      // Le backend refuse explicitement certains imports (dossier possedant
+      // deja une lame, examen deja rattache a un autre patient...). Afficher
+      // son message evite l'impression que « rien ne se passe ».
+      const detail =
+        axios.isAxiosError(cause) && typeof cause.response?.data?.detail === 'string'
+          ? cause.response.data.detail
+          : "L'envoi a échoué. Vérifiez que le service concerné répond.";
+      setError(detail);
     } finally {
       setSending(false);
     }
